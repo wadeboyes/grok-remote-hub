@@ -96,6 +96,14 @@ from hub.session_policy import (
 from hub.session_tailer import EventDedupe, SessionTailer
 from hub.skills_index import list_skills
 from hub.version_info import HUB_VERSION, get_cli_version, structural_compat
+from hub.build_actions import BuildActionError, execute_build_action
+from hub.build_index import (
+    DEFAULT_INDEX_LIMIT,
+    build_catalog,
+    find_catalog_item,
+    grok_home_from_sessions,
+)
+from hub.build_summaries import SummaryStore, item_key, refresh_item_summary
 
 log = logging.getLogger("hub.server")
 
@@ -252,6 +260,9 @@ class Hub:
         # Hub-owned /compact gate: sid → monotonic deadline (in-flight + post grace).
         # While active, notification path skips terminal/started compact broadcasts.
         self._hub_compact_gate: dict[str, float] = {}
+        self.summary_store = SummaryStore(PROJECT_ROOT / "data" / "build_summaries.json")
+        self._summary_task: asyncio.Task | None = None
+        self._summary_force: set[str] = set()
         self.cli_version: str | None = None
         self.compat: dict[str, Any] = {
             "ok": False,
@@ -1619,6 +1630,9 @@ class Hub:
         app.router.add_get("/api/compat", self.handle_compat)
         app.router.add_post("/api/compat/refresh", self.handle_compat_refresh)
         app.router.add_get("/api/sessions", self.handle_sessions)
+        app.router.add_get("/api/build/index", self.handle_build_index)
+        app.router.add_post("/api/build/summaries/refresh", self.handle_build_summaries_refresh)
+        app.router.add_post("/api/build/resume", self.handle_build_resume)
         app.router.add_get("/api/sessions/{id}/history", self.handle_history)
         app.router.add_get("/api/sessions/{id}/plan", self.handle_session_plan)
         app.router.add_post("/api/sessions/{id}/plan/action", self.handle_session_plan_action)
@@ -1694,6 +1708,9 @@ class Hub:
         self._status_resync_task = asyncio.create_task(
             self._status_resync_loop(), name="hub-status-resync"
         )
+        self._summary_task = asyncio.create_task(
+            self._summary_refresh_loop(), name="hub-summary-refresh"
+        )
         try:
             self.ops.emit(
                 "hub_start",
@@ -1719,6 +1736,14 @@ class Hub:
             task.cancel()
             try:
                 await task
+            except asyncio.CancelledError:
+                pass
+        summary_task = self._summary_task
+        self._summary_task = None
+        if summary_task is not None and not summary_task.done():
+            summary_task.cancel()
+            try:
+                await summary_task
             except asyncio.CancelledError:
                 pass
         self.site_preview.stop()
@@ -2381,6 +2406,138 @@ class Hub:
 
     async def handle_sessions(self, request: web.Request) -> web.Response:
         return web.json_response({"items": self._sessions_items_with_status()})
+
+    def _grok_home(self) -> Path:
+        return grok_home_from_sessions(self.config.sessions_root)
+
+    async def handle_build_index(self, request: web.Request) -> web.Response:
+        """All sessions and worktrees, newest first, with stored summaries."""
+        raw_limit = request.rel_url.query.get("limit") or ""
+        try:
+            limit = int(raw_limit) if raw_limit else DEFAULT_INDEX_LIMIT
+        except ValueError:
+            limit = DEFAULT_INDEX_LIMIT
+        limit = max(1, min(limit, DEFAULT_INDEX_LIMIT))
+        catalog = await asyncio.to_thread(
+            build_catalog,
+            self.config.sessions_root,
+            self._grok_home(),
+            self.summary_store,
+            limit=limit,
+        )
+        due = catalog.get("due") or []
+        items = catalog.get("items") or []
+        return web.json_response(
+            {
+                "items": items,
+                "count": catalog.get("count", len(items)),
+                "summaryPending": len(due) if isinstance(due, list) else 0,
+            }
+        )
+
+    async def handle_build_summaries_refresh(self, request: web.Request) -> web.Response:
+        """Schedule summary refresh. The list keeps serving the stored text."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        kind = str(body.get("kind") or "").strip()
+        item_id = str(body.get("id") or "").strip()
+        if item_id:
+            self._summary_force.add(item_key(kind or "session", item_id))
+            if kind == "":
+                self._summary_force.add(item_key("worktree", item_id))
+        else:
+            self._summary_force.add("*")
+        return web.json_response({"ok": True, "scheduled": True})
+
+    async def handle_build_resume(self, request: web.Request) -> web.Response:
+        """One shot resume or restart, then the client opens chatPath."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid json"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "invalid json"}, status=400)
+        kind = str(body.get("kind") or "").strip()
+        item_id = str(body.get("id") or "").strip()
+        mode = str(body.get("mode") or "auto").strip()
+        if not item_id:
+            return web.json_response({"error": "id required"}, status=400)
+        item = await asyncio.to_thread(
+            find_catalog_item,
+            self.config.sessions_root,
+            self._grok_home(),
+            kind=kind,
+            item_id=item_id,
+        )
+        if not item:
+            return web.json_response({"error": "session or worktree not found"}, status=404)
+        try:
+            payload = await execute_build_action(self, item, mode=mode)
+        except BuildActionError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception as exc:
+            log.exception("build resume failed")
+            return web.json_response({"error": str(exc)}, status=500)
+        return web.json_response(payload)
+
+    async def _summary_refresh_loop(self) -> None:
+        """Refresh one stale summary at a time so the hub stays responsive."""
+        await asyncio.sleep(3.0)
+        try:
+            while True:
+                try:
+                    await self._refresh_one_summary()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.debug("summary refresh failed", exc_info=True)
+                await asyncio.sleep(8.0)
+        except asyncio.CancelledError:
+            return
+
+    async def _refresh_one_summary(self) -> None:
+        force_all = "*" in self._summary_force
+        self._summary_force.discard("*")
+        explicit_key = ""
+        if self._summary_force:
+            explicit_key = next(iter(self._summary_force))
+            self._summary_force.discard(explicit_key)
+        catalog = await asyncio.to_thread(
+            build_catalog,
+            self.config.sessions_root,
+            self._grok_home(),
+            self.summary_store,
+            limit=DEFAULT_INDEX_LIMIT,
+        )
+        due = [key for key in (catalog.get("due") or []) if isinstance(key, str)]
+        target = explicit_key or (due[0] if due else "")
+        if not target:
+            return
+        kind, _, item_id = target.partition(":")
+        if not item_id:
+            return
+        item = await asyncio.to_thread(
+            find_catalog_item,
+            self.config.sessions_root,
+            self._grok_home(),
+            kind=kind,
+            item_id=item_id,
+        )
+        if not item:
+            return
+        await asyncio.to_thread(
+            refresh_item_summary,
+            item,
+            self.summary_store,
+            grok_exe=self.config.grok_bin,
+            sessions_root=self.config.sessions_root,
+            scratch_root=PROJECT_ROOT,
+            force=bool(explicit_key) or force_all,
+        )
 
     async def handle_rename_session(self, request: web.Request) -> web.Response:
         session_id = request.match_info["id"]

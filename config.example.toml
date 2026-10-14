@@ -12,7 +12,9 @@ hub_token = ""
 sessions_root = "~/.grok/sessions"
 # Folder that contains your project directories (New Session picker).
 projects_root = "~/Projects"
+# Use grok.exe, never grok.bat. The phone app resume path refuses a .bat shim.
 # grok_bin = "~/.grok/bin/grok.exe"
+# Plain English session summaries are stored in data/build_summaries.json (gitignored).
 # max_sessions = 80
 # max_history_messages = 800
 # Concurrent live turns across different project folders (same cwd queues).

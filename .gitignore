@@ -49,5 +49,14 @@ test-results/
 1.49.0
 node_modules/
 package-lock.json
+# Android sideload build outputs. The release keystore file is tracked.
+# android/keystore.properties holds the password and is not tracked.
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/keystore.properties
+android/.idea/
+*.apk
 npm_install_log.txt
 _release_scan.txt

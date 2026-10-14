@@ -9,6 +9,10 @@ This file is the **public narrative**. Session chat context is not required to u
 
 ## [Unreleased]
 
+### Added
+- **Android sideload app** for the Galaxy S24 Ultra and the Galaxy Tab S10. Home lists every Grok Build session and worktree, newest first, with a stored plain English summary. One tap resumes with `grok.exe --cwd <dir> --resume <session-id>` (never grok.bat) and opens the hub chat. Wide screens use two panes. See `android/README.md`.
+- **Build index API** (`GET /api/build/index`, `POST /api/build/summaries/refresh`, `POST /api/build/resume`). Summaries refresh on the PC when session files change, including a headless `grok -p` pass, and are stored so the list loads without waiting.
+
 ### Changed
 - **Mobile pretty Hub UI** — self-hosted Inter + system-ui (no Google Fonts / no serif fallback), card home, Working resume cards, sticky primary Send, bottom-sheet modals with a grab handle, idle image/video chrome hidden. Critical inline CSS so Tailscale/Brave never flashes raw desktop HTML. Touch ≥44px kept. Desktop (≥900px) stays compact. Static cache-bust `?v=20260905q`.
 - **Mobile-first Hub UI** — phone/tablet portrait uses ≥44px touch targets, full-width primary actions (New / Send / Stop / Approve / Submit / Start), stacked composer above the keyboard, and sheet-style plan / agent-question / new-session / site-preview modals. Desktop (≥900px) stays compact. Working (running/recent) sessions are listed on the empty home for one-tap resume. Static cache-bust `?v=20260905n`.

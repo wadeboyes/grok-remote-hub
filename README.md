@@ -98,7 +98,7 @@ Node 18+ (ES modules), stdlib only. Separate from the Python hub on `:8787`.
 - **Sole-writer prompts** — live turns use hub-owned `session/new`
 - **Dual browser, not dual TUI** — phone + desktop share this process; stock TUI is separate
 
-Design write-ups: **[docs/adr/](docs/adr/)** (ADR 001–020).
+Design write-ups: **[docs/adr/](docs/adr/)** (ADR 001 to 021).
 
 | Path | Live together? | Notes |
 |---|---|---|
@@ -196,6 +196,40 @@ A hub restart is enough after a Python change; a phone hard-refresh is required 
 | Optional HTTPS | Tailscale Serve → `tailscale serve --bg http://127.0.0.1:8787` |
 
 Without Tailscale the hub binds **localhost only** and the UI shows **Local only**.
+
+---
+
+## Android app
+
+Sideload **Grok Remote** on the Galaxy S24 Ultra and the Galaxy Tab S10. The same APK is a narrow single column on the phone and a two pane layout when the window is at least 600dp wide (tablet landscape, and tablet portrait when it is wide). Touch targets are at least 48dp.
+
+The home list is every Grok Build session under `~/.grok/sessions` plus git worktrees under `~/.grok/worktrees`, newest first. It is not limited to a grok-builds folder. Each row has a stored plain English summary (what it is, what was being built, where it got to, what is next). Summaries are generated on the PC and refreshed when the session files change, so the list does not wait on the model.
+
+One tap on **Resume** (or **Restart** when a worktree has no session) calls `POST /api/build/resume`. The hub uses `grok.exe --cwd <dir> --resume <session-id>` (never `grok.bat`) through the existing agent, then the app opens the chat.
+
+| Route | Role |
+|---|---|
+| `GET /api/build/index` | Sessions, worktrees, stored summaries |
+| `POST /api/build/summaries/refresh` | Schedule a summary refresh |
+| `POST /api/build/resume` | Resume or restart, return `chatPath` |
+
+These routes use the same `hub_token` check as the rest of the hub. There is no guest mode. Auto approve on `grok agent serve` is unchanged.
+
+Build, keystore, and install steps: [android/README.md](android/README.md).
+
+### Pull this build on the PC
+
+The PC clone at `C:\Users\WADEBOYES\grok-remote-hub` may still have `origin` pointing at `wadeobyes/grok-remote-hub`. This branch lives on `wadeboyes/grok-remote-hub`. Add that remote, then restart:
+
+```powershell
+cd C:\Users\WADEBOYES\grok-remote-hub
+git remote add wadeboyes https://github.com/wadeboyes/grok-remote-hub.git
+git fetch wadeboyes
+git checkout -B cursor/android-grok-build-v1 wadeboyes/cursor/android-grok-build-v1
+.\restart-hub.ps1
+```
+
+If the remote name `wadeboyes` already exists, skip `git remote add` and run `git fetch wadeboyes`.
 
 ---
 

@@ -1131,6 +1131,23 @@
     return `${proto}//${location.host}/ws${q}`;
   }
 
+  /** Phone app opens /?open=<id>&cwd=<dir>&embed=chat after resume. */
+  function readDeepLink() {
+    let params;
+    try {
+      params = new URL(location.href).searchParams;
+    } catch (_) {
+      return { openId: "", cwd: "", title: "", embedChat: false };
+    }
+    const openId = (params.get("open") || params.get("session") || "").trim();
+    return {
+      openId,
+      cwd: params.get("cwd") || "",
+      title: params.get("title") || "",
+      embedChat: params.get("embed") === "chat",
+    };
+  }
+
   function toast(message, kind = "", durationMs, opts) {
     if (durationMs && typeof durationMs === "object") {
       opts = durationMs;
@@ -11877,6 +11894,11 @@
     } catch (_) {}
     setRailTab(savedTab);
 
+    const deepLink = readDeepLink();
+    if (deepLink.embedChat) {
+      document.documentElement.classList.add("embed-chat");
+    }
+
     try {
       const res = await fetch(apiUrl("/api/sessions"));
       if (res.ok) {
@@ -11885,9 +11907,10 @@
         renderSessions();
         subscribeActiveChildrenOfSelected();
         // Restore last selected chat across refresh (desktop + mobile).
+        // A resume deep link (?open=&cwd=&embed=chat) wins over the saved id.
         // If id is missing from top-N list, open by id when history exists (P1.11).
         const saved = loadSelectedSessionMeta();
-        const savedId = saved && saved.sessionId;
+        const savedId = deepLink.openId || (saved && saved.sessionId);
         if (savedId && Array.isArray(state.sessions)) {
           const row = state.sessions.find((s) => s && s.sessionId === savedId);
           // Cap restore so a hung attach never blocks connectWs forever.
@@ -11896,9 +11919,23 @@
               openSession(sess),
               new Promise((resolve) => setTimeout(resolve, 12000)),
             ]);
-          if (row) {
+          const linked = deepLink.openId
+            ? {
+                sessionId: deepLink.openId,
+                title: deepLink.title || (row && row.title) || (saved && saved.title) || "Session",
+                cwd: deepLink.cwd || (row && row.cwd) || (saved && saved.cwd) || "",
+                modelId: (row && row.modelId) || "",
+              }
+            : null;
+          if (row && !linked) {
             try {
               await openWithCap(row);
+            } catch (_) {
+              // Leave empty-main; connectWs still runs below.
+            }
+          } else if (linked || row) {
+            try {
+              await openWithCap(linked || row);
             } catch (_) {
               // Leave empty-main; connectWs still runs below.
             }
@@ -11907,13 +11944,13 @@
               const hRes = await fetch(
                 apiUrl(`/api/sessions/${encodeURIComponent(savedId)}/history`)
               );
-              if (hRes.status === 404) {
+              if (hRes.status === 404 && !deepLink.openId) {
                 clearSelectedSession();
-              } else if (hRes.ok) {
+              } else if (hRes.ok || deepLink.openId) {
                 await openWithCap({
                   sessionId: savedId,
-                  title: (saved && saved.title) || "Session",
-                  cwd: (saved && saved.cwd) || "",
+                  title: deepLink.title || (saved && saved.title) || "Session",
+                  cwd: deepLink.cwd || (saved && saved.cwd) || "",
                 });
               }
             } catch (_) {

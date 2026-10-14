@@ -5174,3 +5174,19 @@ a {
     border-radius: 999px;
   }
 }
+
+/* Android resume chat: native app owns the list, this view is the transcript. */
+html.embed-chat #rail,
+html.embed-chat #rail-backdrop,
+html.embed-chat #btn-menu,
+html.embed-chat #btn-rail-collapse {
+  display: none !important;
+}
+html.embed-chat #app {
+  display: block;
+  min-height: 100dvh;
+}
+html.embed-chat .main {
+  min-height: 100dvh;
+  width: 100%;
+}

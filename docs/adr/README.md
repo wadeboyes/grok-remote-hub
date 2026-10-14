@@ -45,3 +45,4 @@ a new ADR.
 | 018 | Cold ensure vs hot path attribution | Accepted | 2026-07-24 |
 | 019 | External hub health watchdog (scheduled watch-hub) | Accepted | 2026-07-26 |
 | 020 | Process-local ops metrics and unified diagnostics | Accepted | 2026-07-26 |
+| 021 | Phone build index, stored summaries, hub resume | Accepted | 2026-10-14 |

@@ -9,6 +9,14 @@
   <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
   <link rel="apple-touch-icon" href="/favicon.svg" />
   <title>Grok Remote Hub</title>
+  <script>
+    (function () {
+      try {
+        var q = new URLSearchParams(location.search);
+        if (q.get("embed") === "chat") document.documentElement.classList.add("embed-chat");
+      } catch (e) {}
+    })();
+  </script>
   <!-- Critical first paint: never flash raw HTML if app.css is delayed
        (Tailscale-only path or Brave Shields). No third-party webfonts. -->
   <style>
@@ -80,7 +88,7 @@
       #app.is-home .turn-strip { display: none !important; }
     }
   </style>
-  <link rel="stylesheet" href="/app.css?v=20260905q" />
+  <link rel="stylesheet" href="/app.css?v=20261014a" />
 </head>
 <body style="background:#0a0c10;color:#e8edf5;font-family:Inter,system-ui,-apple-system,'Segoe UI',Roboto,sans-serif">
   <div id="app" class="is-home">
@@ -440,6 +448,6 @@
   <script src="/vendor/marked.min.js"></script>
   <script src="/vendor/purify.min.js"></script>
   <!-- cache-bust: blank-page fix; mermaid loads on demand from app.js when needed -->
-  <script src="/app.js?v=20260905q"></script>
+  <script src="/app.js?v=20261014a"></script>
 </body>
 </html>
