@@ -199,6 +199,7 @@ def _layout(page) -> dict:
             const s = getComputedStyle(el);
             return {
               w: r.width, h: r.height, top: r.top, bottom: r.bottom,
+              left: r.left, right: r.right,
               display: s.display, visibility: s.visibility, opacity: s.opacity
             };
           };
@@ -212,6 +213,12 @@ def _layout(page) -> dict:
           const note = (document.body.innerText || "").includes("No messages yet");
           const empty = document.getElementById("empty-main");
           const emptyShown = !!(empty && getComputedStyle(empty).display !== "none" && !empty.hidden);
+          const send = document.getElementById("btn-send");
+          const attach = document.getElementById("btn-attach");
+          const sb = send ? send.getBoundingClientRect() : null;
+          const ab = attach ? attach.getBoundingClientRect() : null;
+          const sendStyle = send ? getComputedStyle(send) : null;
+          const clipped = !!(send && send.scrollWidth > send.clientWidth + 1);
           return {
             input: box(input),
             shell: box(shell),
@@ -222,7 +229,15 @@ def _layout(page) -> dict:
             emptyShown,
             inputDisabled,
             innerHeight: window.innerHeight,
-            appDisplay: app ? getComputedStyle(app).display : ""
+            innerWidth: window.innerWidth,
+            appDisplay: app ? getComputedStyle(app).display : "",
+            send: sb ? {
+              w: sb.width, h: sb.height, left: sb.left, right: sb.right, top: sb.top,
+              text: (send.textContent || "").trim(),
+              clipped
+            } : null,
+            attach: ab ? { w: ab.width, h: ab.height, left: ab.left, right: ab.right } : null,
+            sendDisplay: sendStyle ? sendStyle.display : ""
           };
         }"""
     )
@@ -272,6 +287,27 @@ def test_embed_chat_shows_composer_at_phone_and_tablet() -> None:
                 assert "rail-backdrop" not in str(layout["hit"]), layout
                 assert layout["inputDisabled"] is False, layout
                 assert sockets["n"] == 1, (sockets["n"], viewport, errors)
+                # Phone width: the field is most of the screen and Send is not clipped.
+                if viewport["width"] == 390:
+                    field = layout["input"]
+                    send = layout["send"]
+                    attach = layout["attach"]
+                    assert field is not None and field["w"] >= viewport["width"] * 0.70, layout
+                    assert send is not None, layout
+                    assert send["text"] == "Send", layout
+                    assert send["clipped"] is False, layout
+                    assert send["w"] >= 44 and send["h"] >= 44, layout
+                    assert send["left"] >= 0 and send["right"] <= viewport["width"] + 1, layout
+                    assert attach is not None and attach["w"] >= 44 and attach["h"] >= 44, layout
+                    assert attach["left"] >= 0, layout
+                    assert attach["right"] <= field["left"] + 2, layout
+                    assert send["left"] >= field["right"] - 2, layout
+                else:
+                    field = layout["input"]
+                    send = layout["send"]
+                    assert field is not None and field["w"] >= viewport["width"] * 0.60, layout
+                    assert send is not None and send["clipped"] is False, layout
+                    assert send["right"] <= viewport["width"] + 1, layout
                 page.close()
         finally:
             browser.close()

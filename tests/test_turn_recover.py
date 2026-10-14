@@ -489,7 +489,7 @@ def test_server_cancels_before_prompt_and_keeps_token_auth() -> None:
 
     js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
     html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
-    assert "20261014e" in html
+    assert "20261014f" in html
     assert 'msg.recovery === "restart_session"' in js
     assert "Restart this session" in js
     offer = js[js.find("function offerSessionRestart") :]

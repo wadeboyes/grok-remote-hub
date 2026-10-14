@@ -118,17 +118,37 @@
       display: none !important;
     }
     html.embed-chat .composer-shell,
-    html.embed-chat #app.is-home .composer-shell,
+    html.embed-chat #app.is-home .composer-shell {
+      display: flex !important;
+      flex-direction: column !important;
+      align-items: stretch;
+      width: 100% !important;
+      max-width: 100%;
+      flex-shrink: 0;
+      box-sizing: border-box;
+    }
     html.embed-chat #app.is-home .turn-strip {
       display: flex !important;
       flex-shrink: 0;
     }
+    html.embed-chat .composer,
+    html.embed-chat #composer-form {
+      display: flex !important;
+      flex-direction: row !important;
+      align-items: flex-end;
+      width: 100% !important;
+      min-width: 0;
+    }
     html.embed-chat #composer-input {
       display: block !important;
+      flex: 1 1 auto;
+      width: auto;
+      min-width: 0;
       min-height: 44px;
+      max-height: 8.5em;
     }
   </style>
-  <link rel="stylesheet" href="/app.css?v=20261014c" />
+  <link rel="stylesheet" href="/app.css?v=20261014f" />
 </head>
 <body style="background:#0a0c10;color:#e8edf5;font-family:Inter,system-ui,-apple-system,'Segoe UI',Roboto,sans-serif">
   <div id="app" class="is-home">
@@ -283,9 +303,12 @@
         </div>
 
         <div class="composer-shell">
-          <div id="turn-strip" class="turn-strip" data-state="idle" aria-live="polite">
-            <span id="turn-strip-text">idle</span>
-            <span id="turn-strip-cursor" class="term-cursor hidden" aria-hidden="true">▋</span>
+          <div class="composer-meta">
+            <div id="turn-strip" class="turn-strip" data-state="idle" aria-live="polite">
+              <span id="turn-strip-text">idle</span>
+              <span id="turn-strip-cursor" class="term-cursor hidden" aria-hidden="true">▋</span>
+            </div>
+            <p id="composer-hint" class="composer-hint muted">Remote agent stream. Load a session to chat; desktop TUI stays separate.</p>
           </div>
           <div id="slash-palette" class="slash-palette hidden" role="listbox" aria-label="Slash commands"></div>
           <form id="composer-form" class="composer">
@@ -315,7 +338,6 @@
               <button type="submit" id="btn-send" class="btn btn-accent" disabled>Send</button>
             </div>
           </form>
-          <p id="composer-hint" class="composer-hint muted">Remote agent stream. Load a session to chat; desktop TUI stays separate.</p>
         </div>
       </div>
 
@@ -488,6 +510,6 @@
   <script src="/vendor/marked.min.js"></script>
   <script src="/vendor/purify.min.js"></script>
   <!-- cache-bust: resume chat opens the deep-linked session; mermaid loads on demand -->
-  <script src="/app.js?v=20261014e"></script>
+  <script src="/app.js?v=20261014f"></script>
 </body>
 </html>

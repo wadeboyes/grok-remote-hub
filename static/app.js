@@ -8257,15 +8257,14 @@
   function autoGrow() {
     const ta = els.input;
     if (!ta) return;
-    const vvHeight =
-      (window.visualViewport && window.visualViewport.height) || window.innerHeight || 600;
-    const maxPx = Math.max(96, Math.floor(vvHeight * 0.35));
     const cs = getComputedStyle(ta);
     const lineH = parseFloat(cs.lineHeight);
     const linePx = Number.isFinite(lineH) && lineH > 0 ? lineH : 16 * 1.35;
     const padY =
       (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
     const minPx = Math.ceil(linePx + padY);
+    /* About five lines. A taller box crowds the transcript on a phone. */
+    const maxPx = Math.max(minPx, Math.ceil(linePx * 5 + padY));
 
     // Measure content height without leaving a tall empty box
     ta.style.height = "0px";

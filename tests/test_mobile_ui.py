@@ -23,7 +23,7 @@ def test_html_home_working_sessions() -> None:
     # Cache-bust so phones pick up the redesign
     assert "app.css?v=" in html
     assert "app.js?v=" in html
-    assert "20261014e" in html
+    assert "20261014f" in html
     assert "html.embed-chat #empty-main" in html
     assert "inter-latin-400.woff2" in html
     # Pretty home: cards + top New; no render-blocking Google Fonts
@@ -113,10 +113,10 @@ def test_css_mobile_touch_targets() -> None:
     assert ".composer-actions" in mobile
     assert ".modal-actions" in mobile
     assert "width: 100%" in mobile
-    # Composer stacks on phone (override the old row-locked 480px rule)
+    # Composer is one full-width row on a phone (attach, field, Send).
     narrow = css[css.find("/* Narrow phones") : css.find("/* Narrow phones") + 900]
-    assert "flex-direction: column" in narrow
-    assert "flex-direction: row" not in narrow
+    assert "flex-direction: row" in narrow
+    assert "flex-direction: column" not in narrow
 
 
 def test_css_desktop_rail_width_unchanged() -> None:

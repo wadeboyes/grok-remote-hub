@@ -240,7 +240,7 @@ def test_ui_and_hub_use_plain_blip_sentence() -> None:
     assert "1011 \\(internal error\\)" in js or "1011 \\\\(internal error\\\\)" in js
     assert "isAcpBlip" in js
     assert "friendlyHubError" in js
-    assert "20261014e" in html
+    assert "20261014f" in html
     assert "ACP_BLIP_USER_MSG" in server
     assert "blip_hold_session_ids" in server
     on_conn = server[server.find("async def _on_acp_connection") :]

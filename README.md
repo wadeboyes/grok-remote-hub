@@ -69,6 +69,7 @@ The stock Grok CLI TUI is excellent on the desktop, but it is a **single local p
 - **Agent status** — pill and `/health` distinguish process up vs ACP connected **and** ACP quality (`ok`/`stale`/`zombie`); auto-reconnect when process is up; after heal exhaustion, **click the hung pill** to restart the agent serve (hub stays up)
 - **Busy agent blip.** A long Grok turn that misses a websocket pong is not marked zombie. The hub reconnects, loads the same session, and keeps streaming. The chat says "Connection to Grok blipped, reconnected. Grok may still be working."
 - **Stuck tool after a drop.** If resume finds a tool still pending, or a turn that never finished, the hub cancels that turn before the next prompt. If Grok still stays silent, the chat offers **Restart this session**. That reloads the same session, or reattaches the Grok process when no other session is in a turn.
+- **Phone composer.** The embedded chat keeps one full-width row at the bottom: attach on the left, the message on the right of it, Send at the end. Status is one short line above that row. The app bar already shows the session title, so the page does not repeat it.
 - **Honest `/compact`** — same ACP compact path as the CLI remote; feedback grounded in session `signals.json` (not cheerful no-ops)
 - **Plan mode (Hub)** — View plan appears **inline** when awaiting/Active; Approve writes `plan_mode.json` (not stock TUI `exit_plan_mode`)
 - **History** — hydrate from `updates.jsonl` when you open a session; load quiet-period suppress avoids history flood thrash
