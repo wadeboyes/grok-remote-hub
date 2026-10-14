@@ -1210,7 +1210,7 @@
   /** Recoverable turn-clear notices (stall / max duration / no output / auto-retry) — not hard failures. */
   function isRecoverableTurnClear(msg) {
     const text = friendlyHubError(msg);
-    return /send again|try again|turn cleared|stalled mid-turn|no activity|max duration|no output|recovering|retrying|still not responding|blipped|reconnected/i.test(
+    return /send again|try again|turn cleared|stalled mid-turn|no activity|max duration|no output|recovering|retrying|still not responding|blipped|reconnected|reloaded|reattached|stuck tool|could not be reloaded/i.test(
       text
     );
   }
@@ -1263,10 +1263,15 @@
     return entry;
   }
 
-  function setStripResendVisible(show) {
+  function setStripResendVisible(show, label) {
     if (!els.btnErrorResend) return;
-    if (show) els.btnErrorResend.classList.remove("hidden");
-    else els.btnErrorResend.classList.add("hidden");
+    if (show) {
+      els.btnErrorResend.classList.remove("hidden");
+      els.btnErrorResend.textContent = label || "Resend";
+    } else {
+      els.btnErrorResend.classList.add("hidden");
+      els.btnErrorResend.textContent = "Resend";
+    }
   }
 
   function updateErrorStrip(entry) {
@@ -1297,7 +1302,11 @@
       }
       els.errorStripTime.textContent = label;
     }
-    setStripResendVisible(!!entry.resend);
+    const restartAction = entry.action === "restart_session";
+    setStripResendVisible(
+      !!entry.resend || restartAction,
+      restartAction ? "Restart this session" : "Resend"
+    );
     // Info strip auto-dismisses; danger stays until Dismiss.
     if (isInfo) {
       state._infoStripTimer = setTimeout(() => {
@@ -3812,6 +3821,87 @@
     try {
       activateUserPrompt(el, { scrollToTop: false });
     } catch (_) {}
+  }
+
+  /**
+   * Reload this session after a dangling tool call. Does not resend the prompt.
+   */
+  function restartThisSession(sessionId) {
+    const sid = String(
+      sessionId || state.selectedId || state.liveTurnSessionId || ""
+    ).trim();
+    if (!sid) {
+      toast("No session to restart", "danger");
+      return;
+    }
+    let cwd = "";
+    const row = (state.sessions || []).find((s) => s && s.sessionId === sid);
+    if (row && row.cwd) cwd = String(row.cwd);
+    if (!cwd) {
+      const lp = loadLastPrompt();
+      if (lp && lp.cwd) cwd = String(lp.cwd);
+    }
+    toast("Restarting this session.", "");
+    if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+      sendWs({ type: "restart_session", sessionId: sid, cwd: cwd || "" });
+      return;
+    }
+    fetch(apiUrl(`/api/sessions/${encodeURIComponent(sid)}/restart-turn`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd: cwd || "" }),
+    })
+      .then(async (res) => {
+        let body = {};
+        try {
+          body = await res.json();
+        } catch (_) {}
+        const detail =
+          (body && body.message) || "Could not restart this session.";
+        if (res.ok && body && body.ok) {
+          reportInfo(detail, { sessionId: sid, source: "restart" });
+        } else {
+          reportError(detail, { sessionId: sid, source: "restart" });
+        }
+      })
+      .catch(() => {
+        reportError("Could not restart this session.", {
+          sessionId: sid,
+          source: "restart",
+        });
+      });
+  }
+
+  /**
+   * One tap after a dangling tool call: reload this session, not the prompt.
+   */
+  function offerSessionRestart(message, sessionId) {
+    const stripMsg =
+      String(message || "").trim() ||
+      "Grok produced no output. The last tool call was still pending when the connection dropped.";
+    const entry = {
+      at: new Date().toISOString(),
+      message: stripMsg,
+      sessionId: sessionId || null,
+      source: "turn",
+      level: "danger",
+      resend: true,
+      action: "restart_session",
+    };
+    if (!state.errorLog) state.errorLog = [];
+    state.errorLog.unshift(entry);
+    if (state.errorLog.length > 40) state.errorLog.length = 40;
+    try {
+      console.error("[hub]", stripMsg, { sessionId: sessionId || null });
+    } catch (_) {}
+    toast(stripMsg, "danger", 30000, {
+      actionLabel: "Restart this session",
+      onAction: () => {
+        restartThisSession(sessionId);
+        dismissErrorStrip();
+      },
+    });
+    updateErrorStrip(entry);
   }
 
   /**
@@ -7737,12 +7827,10 @@
         setTurnRunning(true, sid);
         // Soft notice during same-session no-output auto-recovery (not a dead-end error).
         const runNotice = friendlyHubError(msg.error);
-        if (
-          runNotice &&
-          (isAcpBlip(runNotice) || /recovering|retrying/i.test(runNotice))
-        ) {
+        const clearingNotice = /still pending|clearing that/i.test(runNotice || "");
+        if (runNotice && (isAcpBlip(runNotice) || /recovering|retrying/i.test(runNotice) || clearingNotice)) {
           reportInfo(runNotice, { sessionId: sid, source: "turn" });
-          if (isAcpBlip(runNotice)) {
+          if (isAcpBlip(runNotice) || clearingNotice) {
             const noteKey = `${sid || "_"}:${runNotice}`;
             if (!state._turnClearNotes) state._turnClearNotes = {};
             if (!state._turnClearNotes[noteKey]) {
@@ -7759,10 +7847,9 @@
         }
       } else if (msg.state === "idle") {
         const anyLeft = (state.liveTurns || []).length > 0;
-        const recoverable =
-          !!msg.error && isRecoverableTurnClear(msg.error);
-        const keepPending =
-          !!msg.error && isNoOutputKeepPending(msg.error);
+        const restartSession = msg.recovery === "restart_session";
+        const recoverable = restartSession || (!!msg.error && isRecoverableTurnClear(msg.error));
+        const keepPending = !!msg.error && isNoOutputKeepPending(msg.error);
         if (recoverable) {
           // Force this session fully idle after stall/max-duration clear.
           setTurnRunning(false, sid, {
@@ -7776,7 +7863,8 @@
                 state.liveTurns[state.liveTurns.length - 1].sessionId;
             }
           }
-          if (keepPending) {
+          if (restartSession) offerSessionRestart(String(msg.error || ""), sid);
+          else if (keepPending) {
             const lp = loadLastPrompt();
             if (lp && lp.pending && lp.text && String(lp.text).trim()) {
               offerNoOutputResend(lp, {
@@ -7816,8 +7904,8 @@
         if (msg.error) {
           const shown = friendlyHubError(msg.error);
           if (recoverable) {
-            // Resend offer already toasted for no-output; avoid double toast.
-            if (!keepPending) {
+            // Resend or Restart already toasted; avoid a second toast.
+            if (!keepPending && !restartSession) {
               reportInfo(shown, { sessionId: sid, source: "turn" });
             }
             // Once: also land the notice in the session transcript.
@@ -11335,7 +11423,12 @@
     }
     if (els.btnErrorResend) {
       els.btnErrorResend.addEventListener("click", () => {
-        resendLastPrompt();
+        const entry = state._lastStripError;
+        if (entry && entry.action === "restart_session") {
+          restartThisSession(entry.sessionId);
+        } else {
+          resendLastPrompt();
+        }
         dismissErrorStrip();
       });
     }
