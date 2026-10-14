@@ -6,8 +6,8 @@ Resume uses the same arguments as::
 
 The phone then opens the hub chat. This does not launch a second interactive
 TUI, because that process would fight the hub agent and would not show on
-the phone. Restart calls the hub ``session/new`` in the same folder when
-there is no session to resume, or when the caller asks for a fresh start.
+the phone. When the folder already has a session, that latest session is
+resumed. ``session/new`` runs only when the folder has none.
 ``--always-approve`` on the agent serve is left unchanged.
 """
 
@@ -17,6 +17,7 @@ import logging
 from typing import Any
 from urllib.parse import quote
 
+from hub.build_index import latest_session_id_for_cwd
 from hub.grok_bin import GrokBinError, require_grok_exe, resume_command
 
 log = logging.getLogger("hub.build")
@@ -62,8 +63,23 @@ async def execute_build_action(
     requested = (mode or "auto").strip().lower()
     if requested not in {"auto", "resume", "restart"}:
         raise BuildActionError("mode must be auto, resume, or restart", 400)
-    if requested == "auto":
-        requested = "resume" if session_id else "restart"
+
+    if not session_id:
+        root = getattr(getattr(hub, "config", None), "sessions_root", None)
+        if root:
+            try:
+                session_id = latest_session_id_for_cwd(root, cwd)
+            except Exception:
+                log.debug("latest session lookup failed", exc_info=True)
+                session_id = ""
+
+    # A worktree card used to ask for restart whenever the database had no
+    # linked id. Resume the latest session in that folder when one exists.
+    # Start fresh only when the folder has no session.
+    if session_id:
+        requested = "resume"
+    elif requested == "auto":
+        requested = "restart"
 
     if not getattr(hub.acp, "connected", False):
         raise BuildActionError("agent not connected", 503)

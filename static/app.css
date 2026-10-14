@@ -5179,8 +5179,14 @@ a {
 html.embed-chat #rail,
 html.embed-chat #rail-backdrop,
 html.embed-chat #btn-menu,
-html.embed-chat #btn-rail-collapse {
+html.embed-chat #btn-rail-collapse,
+html.embed-chat #btn-topbar-new,
+html.embed-chat #empty-main {
   display: none !important;
+}
+html.embed-chat #app.is-home .composer-shell,
+html.embed-chat #app.is-home .turn-strip {
+  display: flex !important;
 }
 html.embed-chat #app {
   display: block;

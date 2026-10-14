@@ -78,7 +78,8 @@ class HubClient {
         val payload = JSONObject()
             .put("kind", item.kind)
             .put("id", item.id)
-            .put("mode", if (item.actionHint == "restart") "restart" else "resume")
+            // The hub resumes the latest session in this folder when one exists.
+            .put("mode", "auto")
         val body = request("POST", baseUrl, "/api/build/resume", token, payload, 90000)
         val commandJson = body.optJSONArray("command")
         val command = ArrayList<String>()

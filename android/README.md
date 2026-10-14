@@ -11,14 +11,14 @@ Default hub URL: `http://100.113.227.9:8787`. Put the real `hub_token` in Settin
 
 ## Install on the phone or tablet
 
-This build is **1.0.1** (versionCode 2). It installs over 1.0.0 because the versionCode is higher and the signing key is the same. 1.0.0 does not check for updates, so install this APK once. After that, newer builds can install from the hub.
+This build is **1.0.2** (versionCode 3). It installs over 1.0.1 because the versionCode is higher and the signing key is the same. 1.0.1 can also install this build from the hub after you publish it. The first time the app installs its own update, Android usually asks for one confirm.
 
-1. Copy `GrokRemote-v1.0.1.apk` onto the device (USB, Drive, or a nearby share). Use the same file on the phone and the tablet.
+1. Copy `GrokRemote-v1.0.2.apk` onto the device (USB, Drive, or a nearby share). Use the same file on the phone and the tablet. Or publish it on the hub and tap **Check for updates** in 1.0.1.
 2. Open the APK. If Android blocks it, allow that app (Files, Drive, or Chrome) to install unknown apps.
 3. Install. Later builds signed with the same keystore replace this install. You do not uninstall first.
 4. Connect Tailscale on the device, same tailnet as the PC.
 5. Open **Grok Remote**. Confirm the hub URL. Paste `hub_token` from the PC `config.toml`. Save.
-6. The list loads stored summaries. Tap **Resume** (or **Restart** on a worktree with no session) to open the chat.
+6. The list loads stored summaries. Tap **Resume** to open the chat for that session. A worktree with an existing session resumes the latest one in that folder. A worktree with none starts a fresh session.
 7. On the tablet, rotate to landscape. The list stays on the left and the summary or chat stays on the right.
 8. In Settings, allow Grok Remote to install unknown apps if Android asks. **Check for updates** shows the current version and the version published on the hub.
 
@@ -89,9 +89,11 @@ The button calls `POST /api/build/resume` with the hub token. The hub builds:
 C:\Users\WADEBOYES\.grok\bin\grok.exe --cwd <dir> --resume <session-id>
 ```
 
-It does not launch a second interactive terminal. The hub agent (already started with `grok.exe`, not `grok.bat`) loads that folder and session, and the app opens the hub chat. Restart, when there is no session to resume, starts a new hub session in that folder with `session/new`.
+It does not launch a second interactive terminal. The hub agent (already started with `grok.exe`, not `grok.bat`) loads that folder and session, and the app opens the hub chat. If the folder already has a session, that latest one is resumed, including when the worktree database has no linked id. `session/new` runs only when the folder has no session.
 
-Summaries are written on the PC to `data/build_summaries.json`. The hub reads `chat_history.jsonl` and `prompt_history.jsonl` (and updates or events when those hold the conversation), so a session with history gets a real title and the four summary lines. A headless `grok.exe -p` refresh can still refine that text. It does not pass `--always-approve`. The app only displays what the hub stored. Restart the hub after pulling this branch. A new APK is not required for the title and summary fix.
+The chat page is `/?open=<session-id>&cwd=<folder>&embed=chat&token=<hub_token>`. The hub also sets the same token as a cookie. The WebView stores that cookie before load and does not reuse a cached unauthorized page. The embedded view hides the sidebar and the "No session selected" text, then opens that session so the transcript or the prompt box is ready.
+
+Summaries are written on the PC to `data/build_summaries.json`. The hub reads `chat_history.jsonl` and `prompt_history.jsonl` (and updates or events when those hold the conversation), so a session with history gets a real title and the four summary lines. A headless `grok.exe -p` refresh can still refine that text. It does not pass `--always-approve`. The app only displays what the hub stored. Restart the hub after pulling this branch. The title and summary fix did not need a new APK. The chat open fix does: install 1.0.2.
 
 ## Ship an update
 
@@ -99,7 +101,7 @@ The phone and the tablet ask the hub for updates. They do not use GitHub Release
 
 The app reads the `stable` channel on launch and every 3 hours while it is open. Settings has **Check for updates**, with the current version and the available version.
 
-1. Bump `versionCode` and `versionName` in `android/app/build.gradle.kts`. This build is `1.0.1` (`versionCode` 2). The next build must use a higher `versionCode` than the one installed on the device.
+1. Bump `versionCode` and `versionName` in `android/app/build.gradle.kts`. This build is `1.0.2` (`versionCode` 3). The next build must use a higher `versionCode` than the one installed on the device.
 2. Build the release APK with the stable keystore:
 
 ```powershell

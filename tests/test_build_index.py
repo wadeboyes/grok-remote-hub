@@ -378,6 +378,169 @@ def test_execute_resume_and_restart(tmp_path: Path) -> None:
     assert hub.acp.calls == [("new", r"E:\Side\App-wt")]
 
 
+def test_worktree_without_link_resumes_latest_session(tmp_path: Path) -> None:
+    """A worktree card with no database session id resumes the newest cwd match."""
+    sessions = tmp_path / "sessions"
+    cwd = r"E:\Side\updates"
+    older = "019f1111-1111-1111-1111-111111111111"
+    newer = "019f5555-5555-5555-5555-555555555555"
+    sub = "019f6666-6666-6666-6666-666666666666"
+    _session(sessions, "E%3A%5CSide%5Cupdates", older, cwd, "2026-07-01T12:00:00Z", "Old updates")
+    _session(sessions, "E%3A%5CSide%5Cupdates", newer, "E:/Side/updates", "2026-10-14T10:00:00Z", "Updates")
+    sub_dir = sessions / "E%3A%5CSide%5Cupdates" / sub
+    _summary(
+        sub_dir / "summary.json",
+        {
+            "info": {"id": sub, "cwd": cwd},
+            "generated_title": "Sub updates",
+            "session_summary": "A subagent run.",
+            "updated_at": "2026-10-14T11:00:00Z",
+            "session_kind": "subagent",
+            "num_chat_messages": 2,
+        },
+    )
+    grok_home = tmp_path / "home"
+    accessed = int(datetime(2026, 10, 14, 12, tzinfo=timezone.utc).timestamp())
+    _worktree_db(
+        grok_home / "worktrees.db",
+        [
+            (
+                "wt-updates",
+                "E:/Side/updates",
+                cwd,
+                "updates",
+                "session",
+                "linked",
+                "",
+                "",
+                "",
+                None,
+                accessed,
+                accessed,
+                "alive",
+                json.dumps({"label": "updates"}),
+            )
+        ],
+    )
+
+    items = build_items(sessions, grok_home, limit=100)
+    card = next(item for item in items if item["id"] == "wt-updates")
+    assert card["kind"] == "worktree"
+    assert card["sessionId"] == newer
+    assert card["actionHint"] == "resume"
+
+    exe = tmp_path / "grok.exe"
+    exe.write_text("", encoding="utf-8")
+
+    class FakeAcp:
+        connected = True
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        async def session_new(self, folder: str) -> str:
+            self.calls.append(("new", folder))
+            return "019f9999-9999-9999-9999-999999999999"
+
+    class FakeHub:
+        def __init__(self) -> None:
+            self.acp = FakeAcp()
+            self.config = type(
+                "C",
+                (),
+                {"grok_bin": str(exe), "sessions_root": sessions},
+            )()
+            self.recorded = None
+
+        def _record_hub_session(self, sid: str, folder: str) -> None:
+            self.recorded = (sid, folder)
+
+        def _stamp_origin_sync(self, sid: str, origin: str) -> bool:
+            return True
+
+        async def _ensure_hub_agent_session(self, view, folder, ws, *, notify_switch):
+            return (view, False, "reuse_cwd", "reuse")
+
+    hub = FakeHub()
+    # The phone used to send restart because the card had no linked id.
+    import asyncio
+
+    resumed = asyncio.run(
+        execute_build_action(
+            hub,
+            {
+                "kind": "worktree",
+                "id": "wt-updates",
+                "sessionId": "",
+                "cwd": cwd,
+                "title": "updates",
+            },
+            mode="restart",
+        )
+    )
+    assert resumed["action"] == "resume"
+    assert resumed["viewSessionId"] == newer
+    assert f"open={newer}" in resumed["chatPath"]
+    assert "embed=chat" in resumed["chatPath"]
+    assert hub.acp.calls == []
+    assert hub.recorded is None
+
+
+def test_worktree_with_no_session_still_starts_fresh(tmp_path: Path) -> None:
+    exe = tmp_path / "grok.exe"
+    exe.write_text("", encoding="utf-8")
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+
+    class FakeAcp:
+        connected = True
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        async def session_new(self, folder: str) -> str:
+            self.calls.append(("new", folder))
+            return "019f7777-7777-7777-7777-777777777777"
+
+    class FakeHub:
+        def __init__(self) -> None:
+            self.acp = FakeAcp()
+            self.config = type(
+                "C",
+                (),
+                {"grok_bin": str(exe), "sessions_root": sessions},
+            )()
+
+        def _record_hub_session(self, sid: str, folder: str) -> None:
+            return None
+
+        def _stamp_origin_sync(self, sid: str, origin: str) -> bool:
+            return True
+
+        async def _ensure_hub_agent_session(self, view, folder, ws, *, notify_switch):
+            raise AssertionError("resume should not run when the folder has no session")
+
+    import asyncio
+
+    hub = FakeHub()
+    restarted = asyncio.run(
+        execute_build_action(
+            hub,
+            {
+                "kind": "worktree",
+                "id": "wt-empty",
+                "sessionId": "",
+                "cwd": r"E:\Side\brand-new",
+                "title": "brand new",
+            },
+            mode="auto",
+        )
+    )
+    assert restarted["action"] == "restart"
+    assert "embed=chat" in restarted["chatPath"]
+    assert hub.acp.calls == [("new", r"E:\Side\brand-new")]
+
+
 def test_grok_retry_window() -> None:
     now = datetime(2026, 7, 12, tzinfo=timezone.utc)
     record = {
@@ -406,6 +569,16 @@ def test_build_routes_stay_behind_hub_token() -> None:
 def test_deep_link_hook_present() -> None:
     js = Path("static/app.js").read_text(encoding="utf-8")
     css = Path("static/app.css").read_text(encoding="utf-8")
+    html = Path("static/index.html").read_text(encoding="utf-8")
     assert "function readDeepLink" in js
     assert "embed=chat" in js or 'embed") === "chat"' in js
     assert "html.embed-chat" in css
+    assert "html.embed-chat #empty-main" in css
+    assert "html.embed-chat #empty-main" in html
+    # Deep link still opens when /api/sessions never returns ok.
+    open_at = js.find("deepLink.openId || (saved && saved.sessionId)")
+    fetch_at = js.find('fetch(apiUrl("/api/sessions"))')
+    assert fetch_at >= 0 and open_at > fetch_at
+    ws = js[js.find("function wsUrl") : js.find("function wsUrl") + 400]
+    assert "token=" in ws
+    assert 'encodeURIComponent(t)' in ws

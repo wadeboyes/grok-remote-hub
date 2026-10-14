@@ -1,7 +1,10 @@
 package com.wadeboyes.grokremote.ui
 
 import android.annotation.SuppressLint
+import android.net.Uri
+import android.webkit.CookieManager
 import android.webkit.WebChromeClient
+import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
@@ -538,6 +541,58 @@ private fun EmptyDetail() {
 }
 
 @SuppressLint("SetJavaScriptEnabled")
+private fun prepareChatWebView(webView: WebView) {
+    val settings = webView.settings
+    settings.javaScriptEnabled = true
+    settings.domStorageEnabled = true
+    settings.useWideViewPort = true
+    settings.loadWithOverviewMode = true
+    // A cached 401 for app.js would leave the page on Connecting forever.
+    settings.cacheMode = WebSettings.LOAD_NO_CACHE
+    val cookies = CookieManager.getInstance()
+    cookies.setAcceptCookie(true)
+    cookies.setAcceptThirdPartyCookies(webView, true)
+    webView.clearCache(true)
+}
+
+private fun loadChatUrl(webView: WebView, pageUrl: String) {
+    // The page URL already has ?token=. Also store that same secret as a cookie
+    // so stylesheet, script, and websocket requests are authorized. Android
+    // WebView does not copy the document query string onto those requests.
+    primeHubCookie(pageUrl)
+    val token = pageToken(pageUrl)
+    if (token.isEmpty()) {
+        webView.loadUrl(pageUrl)
+    } else {
+        webView.loadUrl(pageUrl, mapOf("Authorization" to "Bearer $token"))
+    }
+}
+
+private fun pageToken(pageUrl: String): String {
+    return Uri.parse(pageUrl).getQueryParameter("token").orEmpty()
+}
+
+private fun primeHubCookie(pageUrl: String) {
+    val token = pageToken(pageUrl)
+    if (token.isEmpty() || !cookieSafeToken(token)) return
+    val uri = Uri.parse(pageUrl)
+    val scheme = uri.scheme ?: return
+    val authority = uri.authority ?: return
+    val manager = CookieManager.getInstance()
+    manager.setAcceptCookie(true)
+    manager.setCookie("$scheme://$authority/", "hub_token=$token; Path=/")
+    manager.flush()
+}
+
+private fun cookieSafeToken(token: String): Boolean {
+    if (token.isEmpty()) return false
+    return token.all { ch ->
+        val code = ch.code
+        code in 33..126 && ch != ';' && ch != ',' && ch != '"' && ch != '\\'
+    }
+}
+
+@SuppressLint("SetJavaScriptEnabled")
 @Composable
 private fun ChatPane(target: ChatTarget, onBack: () -> Unit, showBack: Boolean) {
     Column(Modifier.fillMaxSize()) {
@@ -570,20 +625,17 @@ private fun ChatPane(target: ChatTarget, onBack: () -> Unit, showBack: Boolean) 
                 .weight(1f),
             factory = { context ->
                 WebView(context).apply {
-                    settings.javaScriptEnabled = true
-                    settings.domStorageEnabled = true
-                    settings.useWideViewPort = true
-                    settings.loadWithOverviewMode = true
+                    prepareChatWebView(this)
                     webViewClient = WebViewClient()
                     webChromeClient = WebChromeClient()
                     tag = target.url
-                    loadUrl(target.url)
+                    loadChatUrl(this, target.url)
                 }
             },
             update = { web ->
                 if (web.tag != target.url) {
                     web.tag = target.url
-                    web.loadUrl(target.url)
+                    loadChatUrl(web, target.url)
                 }
             },
         )

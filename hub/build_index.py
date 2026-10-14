@@ -25,7 +25,8 @@ from hub.build_summaries import (
     local_summary_from_excerpt,
     plain,
 )
-from hub.session_index import scan_sessions
+from hub.session_index import SessionInfo, scan_sessions
+from hub.session_policy import cwd_key
 
 DEFAULT_INDEX_LIMIT = 5000
 
@@ -69,6 +70,44 @@ def _sort_stamp(iso: str) -> float:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.timestamp()
+
+
+def _cwd_match_key(cwd: str) -> str:
+    """Same folder, ignoring slash, case, trailing separator, and \\\\?\\ prefix."""
+    raw = str(cwd or "")
+    if raw.startswith("\\\\?\\"):
+        raw = raw[4:]
+    elif raw.startswith("//?/"):
+        raw = raw[4:]
+    return cwd_key(raw)
+
+
+def latest_sessions_by_cwd(sessions: list[SessionInfo]) -> dict[str, SessionInfo]:
+    """Newest non-subagent session per folder. ``sessions`` is newest first."""
+    latest: dict[str, SessionInfo] = {}
+    for session in sessions:
+        if session.isSubagent:
+            continue
+        if _is_summary_scratch(session.cwd, session.path):
+            continue
+        key = _cwd_match_key(session.cwd)
+        if not key or key in latest:
+            continue
+        latest[key] = session
+    return latest
+
+
+def latest_session_id_for_cwd(sessions_root: Path, cwd: str) -> str:
+    """Session id to resume for ``cwd``, or empty when that folder has none."""
+    if not str(cwd or "").strip():
+        return ""
+    root = Path(sessions_root)
+    if not root.is_dir():
+        return ""
+    matched = latest_sessions_by_cwd(scan_sessions(root, limit=20000)).get(_cwd_match_key(cwd))
+    if matched is None:
+        return ""
+    return str(matched.sessionId or "").strip()
 
 
 def _is_summary_scratch(cwd: str, path: str = "") -> bool:
@@ -281,6 +320,7 @@ def build_items(
 ) -> list[dict[str, Any]]:
     """Sessions and worktrees, newest first. Not limited to one projects folder."""
     sessions = scan_sessions(Path(sessions_root), limit=max(limit, 1) * 4)
+    latest_by_cwd = latest_sessions_by_cwd(sessions)
     by_session_path: dict[str, str] = {}
     items: list[dict[str, Any]] = []
 
@@ -330,6 +370,14 @@ def build_items(
         session_dir: Path | None = None
         if session_id and session_id in by_session_path:
             session_dir = Path(by_session_path[session_id])
+        else:
+            # Database id missing or no longer on disk. Resume the latest
+            # session in this folder instead of always starting a new one.
+            session_id = ""
+            matched = latest_by_cwd.get(_cwd_match_key(path))
+            if matched is not None:
+                session_id = str(matched.sessionId or "").strip()
+                session_dir = Path(matched.path)
         title = str(row.get("title") or "Worktree")
         if session_id and session_id not in session_ids:
             title = title or session_id

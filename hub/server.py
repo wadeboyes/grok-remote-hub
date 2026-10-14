@@ -36,6 +36,7 @@ from hub.site_preview import (
     build_preview_plan,
 )
 from hub.history import load_session_history
+from hub.http_auth import HUB_TOKEN_COOKIE, stamp_token_on_asset_urls, token_accepted
 from hub.plan_view import PlanViewError, apply_plan_action, read_session_plan
 from hub.projects import ProjectError, create_project, list_project_browse
 from hub.multi_turn import (
@@ -1125,15 +1126,37 @@ class Hub:
         # lines written while the socket was down (offsets stay mid-file).
 
     def check_auth(self, request: web.Request) -> bool:
-        token = self.config.hub_token
+        token = self.config.hub_token or ""
+        return token_accepted(
+            token,
+            authorization=request.headers.get("Authorization") or "",
+            query_token=request.rel_url.query.get("token") or "",
+            cookie_token=request.cookies.get(HUB_TOKEN_COOKIE) or "",
+        )
+
+    def _maybe_set_token_cookie(self, request: web.Request, response: web.StreamResponse) -> None:
+        """Remember a token the request already proved, for CSS, JS, and fonts.
+
+        WebView and browser subresources do not copy ``?token=`` from the page
+        URL. The cookie is the same secret, not a second way in.
+        """
+        token = self.config.hub_token or ""
         if not token:
-            return True
-        auth = request.headers.get("Authorization") or ""
-        if auth.lower().startswith("bearer ") and auth[7:].strip() == token:
-            return True
-        if request.rel_url.query.get("token") == token:
-            return True
-        return False
+            return
+        if (request.cookies.get(HUB_TOKEN_COOKIE) or "") == token:
+            return
+        try:
+            response.set_cookie(
+                HUB_TOKEN_COOKIE,
+                token,
+                max_age=60 * 60 * 24 * 30,
+                path="/",
+                httponly=True,
+                samesite="Lax",
+                secure=False,
+            )
+        except Exception:
+            log.debug("could not set hub token cookie", exc_info=True)
 
     @staticmethod
     def _cwd_key(cwd: str) -> str:
@@ -1692,7 +1715,9 @@ class Hub:
             return await handler(request)
         if not self.check_auth(request):
             return web.json_response({"error": "unauthorized"}, status=401)
-        return await handler(request)
+        response = await handler(request)
+        self._maybe_set_token_cookie(request, response)
+        return response
 
     async def _on_startup(self, app: web.Application) -> None:
         # CLI version is cheap and useful even if agent is slow
@@ -1973,8 +1998,24 @@ class Hub:
                 except Exception:
                     log.debug("ACP heal exhausted status broadcast failed", exc_info=True)
 
-    async def handle_index(self, request: web.Request) -> web.FileResponse:
-        return web.FileResponse(Path(self.config.static_dir) / "index.html")
+    async def handle_index(self, request: web.Request) -> web.Response:
+        """Serve the UI. Stamp hub_token onto asset URLs when the page proved it.
+
+        A phone WebView loads ``/?open=&embed=chat&token=``. The stylesheet and
+        script tags would otherwise be unauthorized, so the embedded chat stays
+        on Connecting with no session selected.
+        """
+        path = Path(self.config.static_dir) / "index.html"
+        html = await asyncio.to_thread(path.read_text, encoding="utf-8")
+        token = str(self.config.hub_token or "")
+        if token:
+            html = stamp_token_on_asset_urls(html, token)
+        return web.Response(
+            text=html,
+            content_type="text/html",
+            charset="utf-8",
+            headers={"Cache-Control": "no-store"},
+        )
 
     def _health_body(self) -> dict[str, Any]:
         """Shared health fields for /health and diagnostics."""

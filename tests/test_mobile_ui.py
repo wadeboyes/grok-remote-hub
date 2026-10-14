@@ -23,7 +23,8 @@ def test_html_home_working_sessions() -> None:
     # Cache-bust so phones pick up the redesign
     assert "app.css?v=" in html
     assert "app.js?v=" in html
-    assert "20261014a" in html
+    assert "20261014b" in html
+    assert "html.embed-chat #empty-main" in html
     assert "inter-latin-400.woff2" in html
     # Pretty home: cards + top New; no render-blocking Google Fonts
     assert 'id="btn-topbar-new"' in html
