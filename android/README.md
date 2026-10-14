@@ -11,9 +11,9 @@ Default hub URL: `http://100.113.227.9:8787`. Put the real `hub_token` in Settin
 
 ## Install on the phone or tablet
 
-This build is **1.0.4** (versionCode 5). It installs over 1.0.3 because the versionCode is higher and the signing key is the same. 1.0.3 can also install this build from the hub after you publish it. The first time the app installs its own update, Android usually asks for one confirm.
+This build is **1.0.5** (versionCode 6). It installs over 1.0.4 because the versionCode is higher and the signing key is the same. 1.0.4 can also install this build from the hub after you publish it. The first time the app installs its own update, Android usually asks for one confirm.
 
-1. Copy `GrokRemote-v1.0.4.apk` onto the device (USB, Drive, or a nearby share). Use the same file on the phone and the tablet. Or publish it on the hub and tap **Check for updates** in 1.0.3.
+1. Copy `GrokRemote-v1.0.5.apk` onto the device (USB, Drive, or a nearby share). Use the same file on the phone and the tablet. Or publish it on the hub and tap **Check for updates** in 1.0.4.
 2. Open the APK. If Android blocks it, allow that app (Files, Drive, or Chrome) to install unknown apps.
 3. Install. Later builds signed with the same keystore replace this install. You do not uninstall first.
 4. Connect Tailscale on the device, same tailnet as the PC.
@@ -97,7 +97,15 @@ Each card, and the detail pane, has **Archive**. That hides the session or workt
 
 Worktree cards also have **Remove**. The dialog names the folder and branch and says it can't be undone. The hub deletes that folder with `git worktree remove` from the parent repo and keeps the branch. If there are uncommitted changes or unpushed commits, it refuses and the app asks for **Remove anyway**. That second step uses `--force`. The main checkout and anything outside `~/.grok/worktrees` are refused. Remove also archives the session.
 
-Summaries are written on the PC to `data/build_summaries.json`. The hub reads `chat_history.jsonl` and `prompt_history.jsonl` (and updates or events when those hold the conversation), so a session with history gets a real title and the four summary lines. A headless `grok.exe -p` refresh can still refine that text. It does not pass `--always-approve`. The app only displays what the hub stored. Restart the hub after pulling this branch so archive and remove are available. Install 1.0.4 for the new buttons.
+Summaries are written on the PC to `data/build_summaries.json`. The hub reads `chat_history.jsonl` and `prompt_history.jsonl` (and updates or events when those hold the conversation), so a session with history gets a real title and the four summary lines. A headless `grok.exe -p` refresh can still refine that text. It does not pass `--always-approve`. The app only displays what the hub stored. Restart the hub after pulling this branch so archive, remove, and session alerts are available. Install 1.0.5 for the alerts.
+
+## Session alerts
+
+Settings has **Session alerts**, on by default. Android asks for notification permission (required on Android 13 and newer). While it is on, the app keeps a quiet "Watching sessions" notice and long-polls the hub over Tailscale. There is no FCM. A backup check runs about every 15 minutes if that watch is stopped.
+
+A notification appears when any session finishes, stops with an error, or needs an answer (a question, or a plan still waiting for approval). The title is the session name. The line is "Finished", "Stopped with an error", or "Needs your answer". Each session has its own group. The chat you are looking at on that device does not notify. Tap the notification to open that session's chat.
+
+Auto approve on the agent is unchanged. A permission the hub already answers does not notify.
 
 ## Ship an update
 
@@ -105,7 +113,7 @@ The phone and the tablet ask the hub for updates. They do not use GitHub Release
 
 The app reads the `stable` channel on launch and every 3 hours while it is open. Settings has **Check for updates**, with the current version and the available version.
 
-1. Bump `versionCode` and `versionName` in `android/app/build.gradle.kts`. This build is `1.0.4` (`versionCode` 5). The next build must use a higher `versionCode` than the one installed on the device.
+1. Bump `versionCode` and `versionName` in `android/app/build.gradle.kts`. This build is `1.0.5` (`versionCode` 6). The next build must use a higher `versionCode` than the one installed on the device.
 2. Build the release APK with the stable keystore:
 
 ```powershell

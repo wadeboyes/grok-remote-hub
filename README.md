@@ -216,12 +216,15 @@ One tap on **Resume** calls `POST /api/build/resume`. The hub uses `grok.exe --c
 | `POST /api/build/archive` | Hide a session or worktree from the main lists |
 | `POST /api/build/restore` | Show an archived session or worktree again |
 | `POST /api/build/worktree/remove` | `git worktree remove` for one worktree under `~/.grok/worktrees` |
+| `GET /api/notify/poll` | Long-poll `turn_end` and `pending_question` for phone alerts |
 
 **Archive** hides a card from All, Sessions, and Worktrees and puts it on Archived, with Restore. The hub stores that in `data/archive.json` (session id or worktree path) so both devices match. It does not change `~/.grok/sessions`. The app shows an undo snackbar after archive.
 
 **Remove** is worktrees only. The app asks first, naming the folder and branch, and says it can't be undone. The hub runs `git worktree remove` in the parent repo and does not delete the branch. If the worktree has uncommitted changes or unpushed commits, the hub refuses until a second **Remove anyway**, which passes `--force`. Anything outside `~/.grok/worktrees`, and the main checkout, is refused. Remove also archives that worktree's session.
 
 These routes use the same `hub_token` check as the rest of the hub. There is no guest mode. Auto approve on `grok agent serve` is unchanged.
+
+**Session alerts.** With several turns at once, the phone and the tablet can show a notification when any session finishes, stops with an error, or is waiting on you (a question, or a plan that still needs approval). The shade shows the session title and a short line: "Finished", "Stopped with an error", or "Needs your answer". Notifications for one session stay in that session's group. The chat open on that device stays quiet. Tap the notification to open that session. There is no FCM. The app keeps a quiet "Watching sessions" notice and long-polls `GET /api/notify/poll`. If that watch stops, a backup check runs about every 15 minutes. **Session alerts** in Settings is on by default. Android asks for notification permission.
 
 The app checks the hub for a newer build on launch and every 3 hours. The manifest is `GET /app/update.json` and the file is `GET /app/GrokRemote-<version>.apk`, both behind `hub_token`. Publishing is `python tools/publish_update.py <apk> <channel>` into `data/app-updates/` (not committed). GitHub Releases are not used, because this repo is public.
 

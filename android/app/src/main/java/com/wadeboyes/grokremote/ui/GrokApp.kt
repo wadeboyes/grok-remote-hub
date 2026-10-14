@@ -1,6 +1,8 @@
 package com.wadeboyes.grokremote.ui
 
+import android.Manifest
 import android.annotation.SuppressLint
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.util.Log
 import android.view.ViewGroup
@@ -10,7 +12,9 @@ import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.BackHandler
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -49,6 +53,7 @@ import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.SnackbarResult
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -61,6 +66,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.core.content.ContextCompat
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
@@ -73,11 +79,14 @@ import com.wadeboyes.grokremote.BuildItem
 import com.wadeboyes.grokremote.HubClient
 import com.wadeboyes.grokremote.HubException
 import com.wadeboyes.grokremote.HubSettings
+import com.wadeboyes.grokremote.OpenChat
 import com.wadeboyes.grokremote.SettingsStore
+import com.wadeboyes.grokremote.TurnWatch
 import com.wadeboyes.grokremote.UpdatePhase
 import com.wadeboyes.grokremote.UpdateUi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -88,6 +97,7 @@ private data class ChatTarget(
     val url: String,
     val title: String,
     val notice: String,
+    val sessionId: String = "",
 )
 
 private data class RemovePrompt(
@@ -97,7 +107,11 @@ private data class RemovePrompt(
 )
 
 @Composable
-fun GrokApp(store: SettingsStore, client: HubClient) {
+fun GrokApp(
+    store: SettingsStore,
+    client: HubClient,
+    openChat: StateFlow<OpenChat?>,
+) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     val updater = remember { AppUpdater(context.applicationContext, client) }
@@ -114,6 +128,70 @@ fun GrokApp(store: SettingsStore, client: HubClient) {
     var busyKey by remember { mutableStateOf<String?>(null) }
     var removePrompt by remember { mutableStateOf<RemovePrompt?>(null) }
     val snackbarHostState = remember { SnackbarHostState() }
+    val notifyPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        store.setNotificationAsked()
+        store.setNotificationsEnabled(granted)
+        settings = store.read()
+        if (granted) {
+            TurnWatch.start(context.applicationContext)
+        } else {
+            TurnWatch.stop(context.applicationContext)
+        }
+    }
+
+    fun notificationsAllowed(): Boolean {
+        return ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.POST_NOTIFICATIONS,
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    fun applyNotifications(enabled: Boolean) {
+        if (!enabled) {
+            store.setNotificationsEnabled(false)
+            settings = store.read()
+            TurnWatch.stop(context.applicationContext)
+            return
+        }
+        if (notificationsAllowed()) {
+            store.setNotificationsEnabled(true)
+            settings = store.read()
+            TurnWatch.start(context.applicationContext)
+        } else {
+            notifyPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        if (!store.notificationsEnabled()) return@LaunchedEffect
+        if (notificationsAllowed()) {
+            TurnWatch.start(context.applicationContext)
+        } else if (!store.notificationAsked()) {
+            store.setNotificationAsked()
+            notifyPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    LaunchedEffect(openChat) {
+        openChat.collect { open ->
+            if (open == null || open.sessionId.isBlank()) return@collect
+            val current = store.read()
+            val path = open.chatPath.ifBlank { "/?open=${open.sessionId}&embed=chat" }
+            chat = ChatTarget(
+                url = client.chatUrl(current.hubUrl, path, current.token),
+                title = open.title.ifBlank { "Grok session" },
+                notice = "",
+                sessionId = open.sessionId,
+            )
+            showSettings = false
+        }
+    }
+
+    LaunchedEffect(chat?.sessionId) {
+        store.setOpenSession(chat?.sessionId)
+    }
 
     fun load(scheduleRefresh: Boolean) {
         scope.launch {
@@ -178,6 +256,9 @@ fun GrokApp(store: SettingsStore, client: HubClient) {
                     url = client.chatUrl(current.hubUrl, resumed.chatPath, current.token),
                     title = resumed.title.ifBlank { item.title },
                     notice = notice,
+                    sessionId = resumed.liveSessionId.ifBlank {
+                        resumed.viewSessionId.ifBlank { item.sessionId }
+                    },
                 )
                 showSettings = false
             }.onFailure { exc ->
@@ -337,11 +418,15 @@ fun GrokApp(store: SettingsStore, client: HubClient) {
                     onCheck = {
                         scope.launch { updater.checkAndInstall(settings.hubUrl, settings.token) }
                     },
+                    onNotifications = { enabled -> applyNotifications(enabled) },
                     onSave = { next ->
                         store.write(next)
                         settings = store.read()
                         showSettings = false
                         chat = null
+                        if (next.notificationsEnabled && next.token.isNotBlank() && notificationsAllowed()) {
+                            TurnWatch.start(context.applicationContext)
+                        }
                     },
                 )
             } else if (twoPane) {
@@ -392,11 +477,19 @@ fun GrokApp(store: SettingsStore, client: HubClient) {
                                 onCheck = {
                                     scope.launch { updater.checkAndInstall(settings.hubUrl, settings.token) }
                                 },
+                                onNotifications = { enabled -> applyNotifications(enabled) },
                                 onSave = { next ->
                                     store.write(next)
                                     settings = store.read()
                                     showSettings = false
                                     chat = null
+                                    if (
+                                        next.notificationsEnabled &&
+                                        next.token.isNotBlank() &&
+                                        notificationsAllowed()
+                                    ) {
+                                        TurnWatch.start(context.applicationContext)
+                                    }
                                 },
                             )
                             chat != null -> {
@@ -944,6 +1037,7 @@ private fun SettingsPane(
     updateUi: UpdateUi,
     onBack: () -> Unit,
     onCheck: () -> Unit,
+    onNotifications: (Boolean) -> Unit,
     onSave: (HubSettings) -> Unit,
 ) {
     var url by rememberSaveable(settings.hubUrl) { mutableStateOf(settings.hubUrl) }
@@ -986,7 +1080,13 @@ private fun SettingsPane(
                     localError = "Hub URL must start with http:// or https://."
                 } else {
                     localError = null
-                    onSave(HubSettings(hubUrl = cleaned, token = token.trim()))
+                    onSave(
+                        HubSettings(
+                            hubUrl = cleaned,
+                            token = token.trim(),
+                            notificationsEnabled = settings.notificationsEnabled,
+                        ),
+                    )
                 }
             },
             modifier = Modifier
@@ -994,6 +1094,25 @@ private fun SettingsPane(
                 .heightIn(min = MinTouch),
             colors = ButtonDefaults.buttonColors(containerColor = Accent, contentColor = AccentText),
         ) { Text("Save") }
+        Spacer(Modifier.height(18.dp))
+        Row(
+            Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("Session alerts", style = MaterialTheme.typography.bodyLarge)
+                Text(
+                    "Notify when any session finishes, stops with an error, or needs your answer. The open chat stays quiet.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            Spacer(Modifier.width(12.dp))
+            Switch(
+                checked = settings.notificationsEnabled,
+                onCheckedChange = onNotifications,
+                modifier = Modifier.heightIn(min = MinTouch),
+            )
+        }
         Spacer(Modifier.height(18.dp))
         Text("Current version", style = MaterialTheme.typography.bodySmall)
         Text(

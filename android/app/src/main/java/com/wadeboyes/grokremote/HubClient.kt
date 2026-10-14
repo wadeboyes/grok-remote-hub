@@ -50,6 +50,21 @@ data class UpdateManifest(
     val publishedAt: String,
 )
 
+data class NotifyEvent(
+    val id: Long,
+    val kind: String,
+    val sessionId: String,
+    val title: String,
+    val line: String,
+    val reason: String,
+    val chatPath: String,
+)
+
+data class NotifyPoll(
+    val cursor: Long,
+    val events: List<NotifyEvent>,
+)
+
 data class ResumeResult(
     val action: String,
     val liveSessionId: String,
@@ -203,6 +218,33 @@ class HubClient {
         } finally {
             connection.disconnect()
         }
+    }
+
+    fun pollNotify(baseUrl: String, token: String, since: Long, waitSeconds: Int): NotifyPoll {
+        val wait = waitSeconds.coerceIn(0, 25)
+        val path = "/api/notify/poll?since=$since&wait=$wait"
+        val body = request("GET", baseUrl, path, token, null, (wait + 15) * 1000)
+        val rows = body.optJSONArray("events")
+        val events = ArrayList<NotifyEvent>()
+        if (rows != null) {
+            for (i in 0 until rows.length()) {
+                val row = rows.optJSONObject(i) ?: continue
+                val sessionId = row.optString("sessionId").trim()
+                if (sessionId.isEmpty()) continue
+                events.add(
+                    NotifyEvent(
+                        id = row.optLong("id"),
+                        kind = row.optString("kind"),
+                        sessionId = sessionId,
+                        title = row.optString("title").ifBlank { "Grok session" },
+                        line = row.optString("line").ifBlank { "Finished" },
+                        reason = row.optString("reason"),
+                        chatPath = row.optString("chatPath"),
+                    ),
+                )
+            }
+        }
+        return NotifyPoll(cursor = body.optLong("cursor"), events = events)
     }
 
     fun chatUrl(baseUrl: String, chatPath: String, token: String): String {

@@ -100,7 +100,8 @@ from hub.session_tailer import EventDedupe, SessionTailer
 from hub.skills_index import list_skills
 from hub.version_info import HUB_VERSION, get_cli_version, structural_compat
 from hub.archive import ArchiveError, ArchiveStore, archive_catalog_item, restore_catalog_item
-from hub.build_actions import BuildActionError, execute_build_action
+from hub.build_actions import BuildActionError, chat_path, execute_build_action
+from hub.notify_feed import NotifyFeed, classify_turn_notify
 from hub.build_index import (
     DEFAULT_INDEX_LIMIT,
     build_catalog,
@@ -274,6 +275,8 @@ class Hub:
         self._hub_compact_gate: dict[str, float] = {}
         self.summary_store = SummaryStore(PROJECT_ROOT / "data" / "build_summaries.json")
         self.archive_store = ArchiveStore(PROJECT_ROOT / "data" / "archive.json")
+        # Phone long-poll. In memory only. Same hub_token as every other route.
+        self.notify_feed = NotifyFeed()
         self._summary_task: asyncio.Task | None = None
         self._summary_force: set[str] = set()
         self.cli_version: str | None = None
@@ -707,6 +710,8 @@ class Hub:
                 "toolCallId": payload.get("toolCallId"),
             }
         )
+        if session_id:
+            self._publish_notify(str(session_id), "pending_question", "question")
         # Refresh sessionFlags / pendingQuestionSessions so rail shows question.
         await self.broadcast(self.status_payload())
 
@@ -1694,6 +1699,7 @@ class Hub:
         app.router.add_get("/api/compat", self.handle_compat)
         app.router.add_post("/api/compat/refresh", self.handle_compat_refresh)
         app.router.add_get("/api/sessions", self.handle_sessions)
+        app.router.add_get("/api/notify/poll", self.handle_notify_poll)
         app.router.add_get("/api/build/index", self.handle_build_index)
         app.router.add_post("/api/build/summaries/refresh", self.handle_build_summaries_refresh)
         app.router.add_post("/api/build/resume", self.handle_build_resume)
@@ -2123,6 +2129,26 @@ class Hub:
         except Exception:
             body["acpTraceRecent"] = []
         return body
+
+    async def handle_notify_poll(self, request: web.Request) -> web.Response:
+        """Long-poll turn_end and pending_question events for the phone.
+
+        ``since`` is the last id the client already applied. ``since=-1`` returns
+        the cursor and no events, so a first connect does not replay old turns.
+        ``wait`` seconds (max 25) holds the request until an event or the timeout.
+        """
+        raw_since = request.query.get("since", "0")
+        raw_wait = request.query.get("wait", "20")
+        try:
+            since = int(raw_since)
+        except (TypeError, ValueError):
+            since = 0
+        try:
+            wait = float(raw_wait)
+        except (TypeError, ValueError):
+            wait = 20.0
+        events, cursor = await self.notify_feed.poll(since, wait)
+        return web.json_response({"cursor": cursor, "events": events})
 
     async def handle_health(self, request: web.Request) -> web.Response:
         return web.json_response(self._health_body())
@@ -3588,6 +3614,61 @@ class Hub:
         except Exception:
             log.exception("background cancel task failed")
 
+    def _plan_needs_answer(self, session_id: str) -> bool:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return False
+        try:
+            payload = read_session_plan(self.config.sessions_root, sid, None)
+        except Exception:
+            return False
+        return bool(payload.get("awaitingApproval"))
+
+    def _publish_notify(self, session_id: str, kind: str, reason: str) -> None:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        title = "Grok session"
+        cwd = ""
+        try:
+            session = find_session(self.config.sessions_root, sid)
+            if session is not None:
+                raw = str(session.title or "").strip()
+                if raw:
+                    title = raw[:120]
+                cwd = str(session.cwd or "")
+        except Exception:
+            log.debug("notify title lookup failed", exc_info=True)
+        try:
+            path = chat_path(sid, cwd)
+        except Exception:
+            path = f"/?open={sid}&embed=chat"
+        try:
+            self.notify_feed.publish(
+                session_id=sid,
+                kind=kind,
+                reason=reason,
+                title=title,
+                chat_path=path,
+            )
+        except Exception:
+            log.debug("notify publish failed", exc_info=True)
+
+    def _record_turn_notify(self, session_id: str, state: str, error: str | None) -> None:
+        plan_waiting = False
+        if state == "idle" and session_id and not (error or "").strip():
+            plan_waiting = self._plan_needs_answer(session_id)
+        decision = classify_turn_notify(
+            state,
+            error,
+            plan_waiting=plan_waiting,
+            blip_text=ACP_BLIP_USER_MSG,
+        )
+        if decision is None:
+            return
+        kind, reason = decision
+        self._publish_notify(session_id, kind, reason)
+
     def _is_no_output_error(self, exc: BaseException) -> bool:
         return is_no_output_error_message(exc)
 
@@ -3607,6 +3688,7 @@ class Hub:
         also_session_id: str | None = None,
     ) -> None:
         """Broadcast turn state; optionally also to a view session id (unlock UI)."""
+        self._record_turn_notify(session_id, state, error)
         if error:
             log.warning(
                 "turn_error session=%s state=%s: %s",

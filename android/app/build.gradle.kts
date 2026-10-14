@@ -27,8 +27,8 @@ android {
         // Galaxy S24 Ultra and Galaxy Tab S10 both shipped on Android 14.
         minSdk = 34
         targetSdk = 35
-        versionCode = 5
-        versionName = "1.0.4"
+        versionCode = 6
+        versionName = "1.0.5"
         vectorDrawables.useSupportLibrary = true
     }
 
@@ -77,6 +77,7 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.3")
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+    implementation("androidx.work:work-runtime-ktx:2.10.0")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
 
