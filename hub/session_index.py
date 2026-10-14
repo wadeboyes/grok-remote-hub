@@ -102,9 +102,13 @@ def _has_useful_content(summary: dict[str, Any], session_dir: Path) -> bool:
         return True
     if int(summary.get("num_messages") or 0) > 0:
         return True
-    updates = session_dir / "updates.jsonl"
-    if updates.is_file() and updates.stat().st_size > 0:
-        return True
+    for name in ("updates.jsonl", "chat_history.jsonl", "prompt_history.jsonl", "events.jsonl"):
+        candidate = session_dir / name
+        try:
+            if candidate.is_file() and candidate.stat().st_size > 0:
+                return True
+        except OSError:
+            continue
     return False
 
 

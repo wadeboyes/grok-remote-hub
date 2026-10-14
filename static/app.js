@@ -1044,6 +1044,7 @@
     btnMenu: $("#btn-menu"),
     btnRailCollapse: $("#btn-rail-collapse"),
     btnNew: $("#btn-new"),
+    btnTopbarNew: $("#btn-topbar-new"),
     btnEmptySessions: $("#btn-empty-sessions"),
     btnEmptyNew: $("#btn-empty-new"),
     app: $("#app"),
@@ -1130,6 +1131,23 @@
     return `${proto}//${location.host}/ws${q}`;
   }
 
+  /** Phone app opens /?open=<id>&cwd=<dir>&embed=chat after resume. */
+  function readDeepLink() {
+    let params;
+    try {
+      params = new URL(location.href).searchParams;
+    } catch (_) {
+      return { openId: "", cwd: "", title: "", embedChat: false };
+    }
+    const openId = (params.get("open") || params.get("session") || "").trim();
+    return {
+      openId,
+      cwd: params.get("cwd") || "",
+      title: params.get("title") || "",
+      embedChat: params.get("embed") === "chat",
+    };
+  }
+
   function toast(message, kind = "", durationMs, opts) {
     if (durationMs && typeof durationMs === "object") {
       opts = durationMs;
@@ -1171,10 +1189,29 @@
     }, ms);
   }
 
+  const ACP_BLIP_TEXT =
+    "Connection to Grok blipped, reconnected. Grok may still be working.";
+
+  /** True for the plain blip sentence or the raw websockets 1011 keepalive close. */
+  function isAcpBlip(msg) {
+    const text = String(msg || "");
+    if (text.indexOf(ACP_BLIP_TEXT) >= 0) return true;
+    return (
+      /keepalive ping timeout/i.test(text) || /1011 \(internal error\)/i.test(text)
+    );
+  }
+
+  function friendlyHubError(msg) {
+    const text = String(msg || "");
+    if (isAcpBlip(text)) return ACP_BLIP_TEXT;
+    return text;
+  }
+
   /** Recoverable turn-clear notices (stall / max duration / no output / auto-retry) — not hard failures. */
   function isRecoverableTurnClear(msg) {
-    return /send again|try again|turn cleared|stalled mid-turn|no activity|max duration|no output|recovering|retrying|still not responding/i.test(
-      String(msg || "")
+    const text = friendlyHubError(msg);
+    return /send again|try again|turn cleared|stalled mid-turn|no activity|max duration|no output|recovering|retrying|still not responding|blipped|reconnected|reloaded|reattached|stuck tool|could not be reloaded/i.test(
+      text
     );
   }
 
@@ -1203,6 +1240,45 @@
   }
 
   /**
+   * One status banner for this session. Replaces the previous banner.
+   * No toast and no transcript line for the same event.
+   */
+  function setSessionNotice(sessionId, message, options) {
+    const msg = String(message || "").trim();
+    if (!msg) return null;
+    const opts = options || {};
+    const sid = sessionId || state.selectedId || null;
+    const action = opts.action || null;
+    const entry = {
+      at: new Date().toISOString(),
+      message: msg,
+      sessionId: sid,
+      source: opts.source || "turn",
+      level: opts.level || "info",
+      resend: !!opts.resend || action === "restart_session",
+      action: action,
+      _sessionNotice: true,
+    };
+    if (!state.sessionNotices) state.sessionNotices = {};
+    const key = sid || "_";
+    state.sessionNotices[key] = entry;
+    if (!state.errorLog) state.errorLog = [];
+    state.errorLog = state.errorLog.filter(function (item) {
+      return !(
+        item &&
+        item._sessionNotice &&
+        (item.sessionId || null) === sid
+      );
+    });
+    state.errorLog.unshift(entry);
+    if (state.errorLog.length > 40) state.errorLog.length = 40;
+    const visible =
+      !sid || sid === state.selectedId || sid === state.liveTurnSessionId;
+    if (visible) updateErrorStrip(entry);
+    return entry;
+  }
+
+  /**
    * Soft recoverable notice (turn cleared, etc.): toast + info strip (auto-dismiss 12s).
    */
   function reportInfo(message, meta = {}) {
@@ -1226,10 +1302,15 @@
     return entry;
   }
 
-  function setStripResendVisible(show) {
+  function setStripResendVisible(show, label) {
     if (!els.btnErrorResend) return;
-    if (show) els.btnErrorResend.classList.remove("hidden");
-    else els.btnErrorResend.classList.add("hidden");
+    if (show) {
+      els.btnErrorResend.classList.remove("hidden");
+      els.btnErrorResend.textContent = label || "Resend";
+    } else {
+      els.btnErrorResend.classList.add("hidden");
+      els.btnErrorResend.textContent = "Resend";
+    }
   }
 
   function updateErrorStrip(entry) {
@@ -1260,7 +1341,11 @@
       }
       els.errorStripTime.textContent = label;
     }
-    setStripResendVisible(!!entry.resend);
+    const restartAction = entry.action === "restart_session";
+    setStripResendVisible(
+      !!entry.resend || restartAction,
+      restartAction ? "Restart this session" : "Resend"
+    );
     // Info strip auto-dismisses; danger stays until Dismiss.
     if (isInfo) {
       state._infoStripTimer = setTimeout(() => {
@@ -1372,7 +1457,7 @@
   }
 
   function clearTopbarSessionMeta() {
-    if (els.chatTitle) els.chatTitle.textContent = "Select a session";
+    if (els.chatTitle) els.chatTitle.textContent = "Grok Hub";
     if (els.btnRenameSession) els.btnRenameSession.classList.add("hidden");
     setViewPlanVisible(false);
     state.sessionPlan = null;
@@ -3778,34 +3863,85 @@
   }
 
   /**
+   * Reload this session after a dangling tool call. Does not resend the prompt.
+   */
+  function restartThisSession(sessionId) {
+    const sid = String(
+      sessionId || state.selectedId || state.liveTurnSessionId || ""
+    ).trim();
+    if (!sid) {
+      setSessionNotice(null, "No session to restart.", {
+        level: "danger",
+        source: "restart",
+      });
+      return;
+    }
+    let cwd = "";
+    const row = (state.sessions || []).find((s) => s && s.sessionId === sid);
+    if (row && row.cwd) cwd = String(row.cwd);
+    if (!cwd) {
+      const lp = loadLastPrompt();
+      if (lp && lp.cwd) cwd = String(lp.cwd);
+    }
+    setSessionNotice(sid, "Restarting this session.", {
+      level: "info",
+      source: "restart",
+    });
+    if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+      sendWs({ type: "restart_session", sessionId: sid, cwd: cwd || "" });
+      return;
+    }
+    fetch(apiUrl(`/api/sessions/${encodeURIComponent(sid)}/restart-turn`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd: cwd || "" }),
+    })
+      .then(async (res) => {
+        let body = {};
+        try {
+          body = await res.json();
+        } catch (_) {}
+        const detail =
+          (body && body.message) || "Could not restart this session.";
+        setSessionNotice(sid, detail, {
+          level: res.ok && body && body.ok ? "info" : "danger",
+          source: "restart",
+        });
+      })
+      .catch(() => {
+        setSessionNotice(sid, "Could not restart this session.", {
+          level: "danger",
+          source: "restart",
+        });
+      });
+  }
+
+  /**
+   * One tap after a dangling tool call: reload this session, not the prompt.
+   */
+  function offerSessionRestart(message, sessionId) {
+    const stripMsg =
+      String(message || "").trim() ||
+      "Grok produced no output. The last tool call was still pending when the connection dropped.";
+    setSessionNotice(sessionId, stripMsg, {
+      level: "danger",
+      source: "turn",
+      action: "restart_session",
+    });
+  }
+
+  /**
    * One-tap Resend when agent produced no output (prompt may not be on disk).
    */
   function offerNoOutputResend(lastPrompt, meta = {}) {
     const stripMsg =
       (meta && meta.message) ||
       "Agent produced no output. Prompt may not be on disk. Resend.";
-    const entry = {
-      at: new Date().toISOString(),
-      message: stripMsg,
-      sessionId: (lastPrompt && lastPrompt.sessionId) || null,
-      source: (meta && meta.source) || "turn",
-      level: "danger",
-      resend: true,
-    };
-    if (!state.errorLog) state.errorLog = [];
-    state.errorLog.unshift(entry);
-    if (state.errorLog.length > 40) state.errorLog.length = 40;
-    try {
-      console.error("[hub]", stripMsg, meta || {});
-    } catch (_) {}
-    toast(stripMsg, "danger", 30000, {
-      actionLabel: "Resend",
-      onAction: () => {
-        resendLastPrompt();
-        dismissErrorStrip();
-      },
-    });
-    updateErrorStrip(entry);
+    setSessionNotice(
+      (lastPrompt && lastPrompt.sessionId) || null,
+      stripMsg,
+      { level: "danger", source: "turn", resend: true }
+    );
   }
 
   /**
@@ -3828,7 +3964,7 @@
     try {
       console.error("[hub]", stripMsg, meta || {});
     } catch (_) {}
-    toast("Hub restarted — turn interrupted", "danger", 30000, {
+    toast("Hub restarted. Turn interrupted.", "danger", 30000, {
       actionLabel: "Resend",
       onAction: () => {
         resendLastPrompt();
@@ -4234,6 +4370,110 @@
     return !s.isSubagent;
   }
 
+  function compareSessionsNewest(a, b) {
+    const ap = isPinned(a.sessionId) ? 1 : 0;
+    const bp = isPinned(b.sessionId) ? 1 : 0;
+    if (ap !== bp) return bp - ap;
+    const rank = (s) => {
+      const st = sessionLiveStatus(s.sessionId) || s.liveStatus || "idle";
+      if (st === "question") return 2;
+      if (st === "working" || st === "stuck") return 1;
+      return 0;
+    };
+    const ar = rank(a);
+    const br = rank(b);
+    if (ar !== br) return br - ar;
+    const at = a.updatedAt || "";
+    const bt = b.updatedAt || "";
+    if (at === bt) return 0;
+    return at < bt ? 1 : -1;
+  }
+
+  function homeWorkingSessions() {
+    return (state.sessions || [])
+      .filter((s) => isWorkingSession(s))
+      .slice()
+      .sort(compareSessionsNewest)
+      .slice(0, 8);
+  }
+
+  function renderHomeSessions() {
+    const host = document.getElementById("home-sessions");
+    const empty = document.getElementById("home-sessions-empty");
+    const heading = document.getElementById("home-sessions-heading");
+    if (!host) return;
+    const items = homeWorkingSessions();
+    host.innerHTML = "";
+    if (empty) empty.classList.toggle("hidden", items.length > 0);
+    if (heading) heading.classList.toggle("hidden", items.length === 0);
+    for (const s of items) {
+      const liveStatus = sessionLiveStatus(s.sessionId) || s.liveStatus || "idle";
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "home-session-row";
+      btn.setAttribute("role", "listitem");
+      btn.setAttribute("data-session-id", s.sessionId || "");
+      if (liveStatus === "working") btn.classList.add("turn-live", "status-working");
+      if (liveStatus === "question") btn.classList.add("turn-live", "status-question");
+      if (liveStatus === "stuck") btn.classList.add("turn-live", "status-stuck");
+
+      const bar = document.createElement("span");
+      bar.className = "live-bar";
+      bar.setAttribute("aria-hidden", "true");
+
+      const body = document.createElement("span");
+      body.className = "home-session-body";
+
+      const titleRow = document.createElement("span");
+      titleRow.className = "title-row";
+      const title = document.createElement("span");
+      title.className = "title";
+      title.textContent = s.title || "Untitled session";
+      titleRow.appendChild(title);
+      if (liveStatus === "stuck") {
+        const pill = document.createElement("span");
+        pill.className = "session-pill status-stuck";
+        pill.textContent = "Stuck";
+        titleRow.appendChild(pill);
+      } else if (liveStatus === "working") {
+        const pill = document.createElement("span");
+        pill.className = "session-pill status-working";
+        pill.textContent = "Working";
+        titleRow.appendChild(pill);
+      } else if (liveStatus === "question") {
+        const pill = document.createElement("span");
+        pill.className = "session-pill status-question";
+        pill.textContent = "Needs reply";
+        titleRow.appendChild(pill);
+      }
+
+      const meta = document.createElement("span");
+      meta.className = "meta";
+      const proj = document.createElement("span");
+      proj.textContent = basename(s.cwd) || "project";
+      meta.appendChild(proj);
+      const time = document.createElement("span");
+      time.textContent = relativeTime(s.updatedAt);
+      meta.appendChild(time);
+
+      const cta = document.createElement("span");
+      cta.className = "home-session-cta";
+      cta.textContent =
+        liveStatus === "question"
+          ? "Reply"
+          : liveStatus === "working" || liveStatus === "stuck"
+            ? "Resume"
+            : "Open";
+
+      body.append(titleRow, meta);
+      btn.append(bar, body, cta);
+      btn.addEventListener("click", () => {
+        openSession(s);
+      });
+      host.appendChild(btn);
+    }
+  }
+
   function renderSessions() {
     const q = state.filter.trim().toLowerCase();
     const items = state.sessions
@@ -4252,25 +4492,7 @@
         );
       })
       .slice()
-      .sort((a, b) => {
-        const ap = isPinned(a.sessionId) ? 1 : 0;
-        const bp = isPinned(b.sessionId) ? 1 : 0;
-        if (ap !== bp) return bp - ap;
-        // Question sessions first (agent waiting), then working/stuck, then rest.
-        const rank = (s) => {
-          const st = sessionLiveStatus(s.sessionId) || s.liveStatus || "idle";
-          if (st === "question") return 2;
-          if (st === "working" || st === "stuck") return 1;
-          return 0;
-        };
-        const ar = rank(a);
-        const br = rank(b);
-        if (ar !== br) return br - ar;
-        const at = a.updatedAt || "";
-        const bt = b.updatedAt || "";
-        if (at === bt) return 0;
-        return at < bt ? 1 : -1;
-      });
+      .sort(compareSessionsNewest);
 
     els.sessionList.innerHTML = "";
     els.sessionEmpty.classList.toggle("hidden", items.length > 0);
@@ -4463,6 +4685,7 @@
       els.sessionList.appendChild(btn);
     }
     _sessionPillRanks = nextPillRanks;
+    renderHomeSessions();
   }
 
   function emptyStreamBuffers() {
@@ -4705,7 +4928,14 @@
     }
   }
 
+  function setAppHomeMode(isHome) {
+    const app = els.app || document.getElementById("app");
+    if (app) app.classList.toggle("is-home", !!isHome);
+    if (els.btnTopbarNew) els.btnTopbarNew.classList.toggle("hidden", !isHome);
+  }
+
   function showEmptyMain(show) {
+    setAppHomeMode(!!show);
     if (show) {
       // Hide panes; show empty card in transcript shell
       if (els.transcript) {
@@ -4721,12 +4951,20 @@
         wrap.className = "empty-main";
         wrap.innerHTML = `
           <div class="empty-card">
-            <h2>No session selected</h2>
-            <p class="empty-sub">Pick a chat from the sidebar, or start a new one.</p>
-            <p>Your project sessions appear under Working. Subagent runs are under Subagent.</p>
+            <div class="empty-hero">
+              <span class="empty-mark" aria-hidden="true"></span>
+              <h2>No session selected</h2>
+              <p class="empty-sub">Pick a chat from the sidebar, or start a new one.</p>
+              <p class="empty-lead">Your project sessions appear under Working. Subagent runs are under Subagent.</p>
+            </div>
+            <div id="home-sessions-wrap" class="home-sessions-wrap">
+              <h3 class="home-sessions-heading" id="home-sessions-heading">Working</h3>
+              <div id="home-sessions" class="home-sessions" role="list" aria-labelledby="home-sessions-heading"></div>
+              <p id="home-sessions-empty" class="home-sessions-empty muted">No working sessions yet. Start one below.</p>
+            </div>
             <div class="empty-actions">
-              <button type="button" id="btn-empty-sessions" class="btn btn-ghost">Browse sessions</button>
-              <button type="button" id="btn-empty-new" class="btn btn-accent">New session</button>
+              <button type="button" id="btn-empty-new" class="btn btn-accent btn-block">New session</button>
+              <button type="button" id="btn-empty-sessions" class="btn btn-ghost btn-block">Browse sessions</button>
             </div>
           </div>`;
         els.transcript.appendChild(wrap);
@@ -4734,6 +4972,7 @@
         $("#btn-empty-new", wrap).addEventListener("click", openNewModal);
       }
       wrap.hidden = false;
+      renderHomeSessions();
       setSessionMode("none");
       syncBrowseSessionsVisibility();
     } else {
@@ -5447,7 +5686,7 @@
       showEmptyMain(false);
       if (state.selectedId) showSessionPane(state.selectedId);
       if (!messages || !messages.length) {
-        appendMessage({ role: "system", text: "No prior transcript on disk for this session." });
+        appendMessage({ role: "system", text: "No messages yet" });
       } else {
         for (const m of messages) {
           appendMessage(m);
@@ -6840,7 +7079,7 @@
         if (!list.length) {
           appendMessage({
             role: "system",
-            text: "No prior transcript on disk for this session.",
+            text: "No messages yet",
           });
         } else {
           for (let i = 0; i < list.length; i++) appendMessage(list[i]);
@@ -7179,6 +7418,16 @@
   }
 
   function connectWs() {
+    // pageshow and bootstrap both call this. A slow session/load used to
+    // leave the first socket up and open a second one a couple of seconds later.
+    const existing = state.ws;
+    if (
+      existing &&
+      (existing.readyState === WebSocket.CONNECTING ||
+        existing.readyState === WebSocket.OPEN)
+    ) {
+      return;
+    }
     if (state.reconnectTimer) {
       clearTimeout(state.reconnectTimer);
       state.reconnectTimer = null;
@@ -7585,16 +7834,16 @@
         }
       } else if (msg.state === "running") {
         setTurnRunning(true, sid);
-        // Soft notice during same-session no-output auto-recovery (not a dead-end error).
-        if (msg.error && /recovering|retrying/i.test(String(msg.error))) {
-          reportInfo(msg.error, { sessionId: sid, source: "turn" });
+        // One banner. The next notice for this session replaces it.
+        const runNotice = friendlyHubError(msg.error);
+        if (runNotice) {
+          setSessionNotice(sid, runNotice, { level: "info", source: "turn" });
         }
       } else if (msg.state === "idle") {
         const anyLeft = (state.liveTurns || []).length > 0;
-        const recoverable =
-          !!msg.error && isRecoverableTurnClear(msg.error);
-        const keepPending =
-          !!msg.error && isNoOutputKeepPending(msg.error);
+        const restartSession = msg.recovery === "restart_session";
+        const recoverable = restartSession || (!!msg.error && isRecoverableTurnClear(msg.error));
+        const keepPending = !!msg.error && isNoOutputKeepPending(msg.error);
         if (recoverable) {
           // Force this session fully idle after stall/max-duration clear.
           setTurnRunning(false, sid, {
@@ -7606,16 +7855,6 @@
             if (!state.liveTurnSessionId && state.liveTurns.length) {
               state.liveTurnSessionId =
                 state.liveTurns[state.liveTurns.length - 1].sessionId;
-            }
-          }
-          if (keepPending) {
-            const lp = loadLastPrompt();
-            if (lp && lp.pending && lp.text && String(lp.text).trim()) {
-              offerNoOutputResend(lp, {
-                reason: "no-output",
-                message: msg.error,
-                source: "turn",
-              });
             }
           }
         } else if (anyLeft) {
@@ -7646,26 +7885,28 @@
           }
         }
         if (msg.error) {
-          if (recoverable) {
-            // Resend offer already toasted for no-output; avoid double toast.
-            if (!keepPending) {
-              reportInfo(msg.error, { sessionId: sid, source: "turn" });
+          const shown = friendlyHubError(msg.error);
+          if (restartSession) {
+            offerSessionRestart(shown, sid);
+          } else if (recoverable && keepPending) {
+            const lp = loadLastPrompt();
+            if (lp && lp.pending && lp.text && String(lp.text).trim()) {
+              offerNoOutputResend(lp, {
+                reason: "no-output",
+                message: shown,
+                source: "turn",
+              });
+            } else {
+              setSessionNotice(sid, shown, {
+                level: "danger",
+                source: "turn",
+                resend: true,
+              });
             }
-            // Once: also land the notice in the session transcript.
-            const noteKey = `${sid || "_"}:${msg.error}`;
-            if (!state._turnClearNotes) state._turnClearNotes = {};
-            if (!state._turnClearNotes[noteKey]) {
-              state._turnClearNotes[noteKey] = true;
-              const appendClearNote = () =>
-                appendMessage({ role: "system", text: msg.error });
-              if (!sid || sid === state.selectedId) {
-                appendClearNote();
-              } else {
-                withSessionTarget(sid, appendClearNote);
-              }
-            }
+          } else if (recoverable) {
+            setSessionNotice(sid, shown, { level: "info", source: "turn" });
           } else {
-            reportError(msg.error, { sessionId: sid, source: "turn" });
+            reportError(shown, { sessionId: sid, source: "turn" });
           }
         }
         if (!sid || sid === state.selectedId) {
@@ -7681,10 +7922,11 @@
       return;
     }
     if (type === "error") {
-      const errText = msg.message || "Error";
+      const errText = friendlyHubError(msg.message || "Error");
       const queueFull = /queue full/i.test(errText);
       const busy = /busy|stuck/i.test(errText);
-      const recovering = /recovering|retrying/i.test(errText);
+      const recovering =
+        isAcpBlip(errText) || /recovering|retrying/i.test(errText);
       const soft = recovering || isRecoverableTurnClear(errText);
       // Queue-full / busy from old hub: keep turnRunning; do not unlock the turn.
       // Recovery in progress: keep turnRunning so composer stays in working state.
@@ -7728,7 +7970,6 @@
 
   function onUserQuestion(msg) {
     const requestId = String(msg.requestId || "");
-    if (!requestId) return;
     // Resolve sessionId with fallbacks so rail always gets a flag.
     const sessionId =
       (msg.sessionId && String(msg.sessionId)) ||
@@ -7743,6 +7984,13 @@
       }
       markSessionActivity(sessionId, "question");
     }
+    if (!requestId) {
+      const title =
+        String(msg.title || "").trim() || "Grok needs your answer.";
+      setSessionNotice(sessionId, title, { level: "info", source: "turn" });
+      if (msg.kind === "plan" && sessionId) refreshSessionPlan(sessionId);
+      return;
+    }
     state.pendingUserQuestion = {
       requestId,
       sessionId,
@@ -7751,7 +7999,15 @@
     };
     // Always open modal so the question stays answerable. Rail "Needs reply"
     // flag remains the primary multi-session notification.
+    const replayed = !!msg.quiet || msg.kind === "permission" || msg.kind === "plan";
     openAskUserModal();
+    if (replayed) {
+      setSessionNotice(sessionId, "Grok needs your answer.", {
+        level: "info",
+        source: "turn",
+      });
+      return;
+    }
     let toastTitle = "";
     if (sessionId && Array.isArray(state.sessions)) {
       const row = state.sessions.find((s) => s && s.sessionId === sessionId);
@@ -7999,15 +8255,14 @@
   function autoGrow() {
     const ta = els.input;
     if (!ta) return;
-    const vvHeight =
-      (window.visualViewport && window.visualViewport.height) || window.innerHeight || 600;
-    const maxPx = Math.max(96, Math.floor(vvHeight * 0.35));
     const cs = getComputedStyle(ta);
     const lineH = parseFloat(cs.lineHeight);
     const linePx = Number.isFinite(lineH) && lineH > 0 ? lineH : 16 * 1.35;
     const padY =
       (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
     const minPx = Math.ceil(linePx + padY);
+    /* About five lines. A taller box crowds the transcript on a phone. */
+    const maxPx = Math.max(minPx, Math.ceil(linePx * 5 + padY));
 
     // Measure content height without leaving a tall empty box
     ta.style.height = "0px";
@@ -10850,6 +11105,7 @@
       els.btnRailCollapse.addEventListener("click", closeRail);
     }
     els.btnNew.addEventListener("click", openNewModal);
+    if (els.btnTopbarNew) els.btnTopbarNew.addEventListener("click", openNewModal);
     if (els.btnEmptyNew) els.btnEmptyNew.addEventListener("click", openNewModal);
     if (els.btnEmptySessions) els.btnEmptySessions.addEventListener("click", openRail);
     if (els.btnRenameSession) {
@@ -11164,7 +11420,12 @@
     }
     if (els.btnErrorResend) {
       els.btnErrorResend.addEventListener("click", () => {
-        resendLastPrompt();
+        const entry = state._lastStripError;
+        if (entry && entry.action === "restart_session") {
+          restartThisSession(entry.sessionId);
+        } else {
+          resendLastPrompt();
+        }
         dismissErrorStrip();
       });
     }
@@ -11772,6 +12033,27 @@
     } catch (_) {}
     setRailTab(savedTab);
 
+    const deepLink = readDeepLink();
+    if (deepLink.embedChat) {
+      document.documentElement.classList.add("embed-chat");
+      // Native app already picked the session. Paint the composer before
+      // history and attach return, and connect once.
+      showEmptyMain(false);
+      if (deepLink.openId) {
+        state.selectedId = deepLink.openId;
+        state.selectedMeta = {
+          sessionId: deepLink.openId,
+          title: deepLink.title || "Session",
+          cwd: deepLink.cwd || "",
+        };
+        showSessionPane(deepLink.openId);
+        if (!transcriptRoot().querySelector(".term-line")) {
+          appendMessage({ role: "system", text: "No messages yet" });
+        }
+      }
+      connectWs();
+    }
+
     try {
       const res = await fetch(apiUrl("/api/sessions"));
       if (res.ok) {
@@ -11779,45 +12061,62 @@
         state.sessions = data.items || [];
         renderSessions();
         subscribeActiveChildrenOfSelected();
-        // Restore last selected chat across refresh (desktop + mobile).
-        // If id is missing from top-N list, open by id when history exists (P1.11).
-        const saved = loadSelectedSessionMeta();
-        const savedId = saved && saved.sessionId;
-        if (savedId && Array.isArray(state.sessions)) {
-          const row = state.sessions.find((s) => s && s.sessionId === savedId);
-          // Cap restore so a hung attach never blocks connectWs forever.
-          const openWithCap = (sess) =>
-            Promise.race([
-              openSession(sess),
-              new Promise((resolve) => setTimeout(resolve, 12000)),
-            ]);
-          if (row) {
-            try {
-              await openWithCap(row);
-            } catch (_) {
-              // Leave empty-main; connectWs still runs below.
-            }
-          } else {
-            try {
-              const hRes = await fetch(
-                apiUrl(`/api/sessions/${encodeURIComponent(savedId)}/history`)
-              );
-              if (hRes.status === 404) {
-                clearSelectedSession();
-              } else if (hRes.ok) {
-                await openWithCap({
-                  sessionId: savedId,
-                  title: (saved && saved.title) || "Session",
-                  cwd: (saved && saved.cwd) || "",
-                });
-              }
-            } catch (_) {
-              // Keep pin for retry when agent/hub recovers.
-            }
-          }
-        }
       }
     } catch (_) {}
+
+    // Restore last selected chat across refresh (desktop + mobile).
+    // A resume deep link (?open=&cwd=&embed=chat) wins over the saved id,
+    // including when /api/sessions failed or the new id is not listed yet.
+    if (!Array.isArray(state.sessions)) state.sessions = [];
+    const saved = loadSelectedSessionMeta();
+    const savedId = deepLink.openId || (saved && saved.sessionId);
+    if (savedId) {
+      const row = state.sessions.find((s) => s && s.sessionId === savedId);
+      // Cap restore so a hung attach never blocks connectWs forever.
+      const openWithCap = (sess) =>
+        Promise.race([
+          openSession(sess),
+          new Promise((resolve) => setTimeout(resolve, 12000)),
+        ]);
+      const linked = deepLink.openId
+        ? {
+            sessionId: deepLink.openId,
+            title: deepLink.title || (row && row.title) || (saved && saved.title) || "Session",
+            cwd: deepLink.cwd || (row && row.cwd) || (saved && saved.cwd) || "",
+            modelId: (row && row.modelId) || "",
+          }
+        : null;
+      if (row && !linked) {
+        try {
+          await openWithCap(row);
+        } catch (_) {
+          // Leave empty-main; connectWs still runs below.
+        }
+      } else if (linked || row) {
+        try {
+          await openWithCap(linked || row);
+        } catch (_) {
+          // Leave empty-main; connectWs still runs below.
+        }
+      } else {
+        try {
+          const hRes = await fetch(
+            apiUrl(`/api/sessions/${encodeURIComponent(savedId)}/history`)
+          );
+          if (hRes.status === 404 && !deepLink.openId) {
+            clearSelectedSession();
+          } else if (hRes.ok || deepLink.openId) {
+            await openWithCap({
+              sessionId: savedId,
+              title: deepLink.title || (saved && saved.title) || "Session",
+              cwd: deepLink.cwd || (saved && saved.cwd) || "",
+            });
+          }
+        } catch (_) {
+          // Keep pin for retry when agent/hub recovers.
+        }
+      }
+    }
 
     await refreshSkills();
     connectWs();
@@ -11869,6 +12168,7 @@
     },
     setSessionsForTest(items) {
       state.sessions = Array.isArray(items) ? items : [];
+      renderSessions();
     },
     getSessionIdsForTest() {
       return {
@@ -11887,6 +12187,11 @@
     pickUserPromptIndex,
     syncStickyUserFromScroll,
     scheduleStickyUserFromScroll,
+    renderHomeSessions,
+    homeWorkingSessions,
+    compareSessionsNewest,
+    isWorkingSession,
+    setAppHomeMode,
   };
 
   bootstrap();

@@ -16,6 +16,8 @@ from hub.acp_ask_user import (
 )
 from hub.acp_fs import read_text_file, write_text_file
 from hub.acp_permissions import pick_permission_option
+from hub.history import normalize_status
+from hub.pending_interaction import describe_pending_interaction, permission_as_question
 from hub.acp_terminal import TerminalManager
 from hub.acp_trace import AcpTrace, session_id_slice
 from hub.config import Config
@@ -33,6 +35,10 @@ from hub.session_policy import (
     notification_counts_as_turn_activity,
     notification_is_rich_activity,
     session_notification_kind,
+    ACP_BLIP_USER_MSG,
+    is_connection_closed,
+    is_keepalive_ping_timeout,
+    session_stream_kind,
     should_force_clear_turn,
     should_skip_session_load,
 )
@@ -49,6 +55,16 @@ from hub.status_view import (
 )
 
 log = logging.getLogger("hub.acp")
+
+# websockets keepalive: a 1011 ping timeout on this loopback client usually means
+# the hub asyncio loop was blocked (file reads, JSON, summaries, git) and could
+# not answer the ping. It does not mean Grok was busy. Disable library pings.
+# Idle half-open sockets are checked by maybe_probe_liveness, which does not run
+# while a prompt is pending. https://websockets.readthedocs.io/en/stable/topics/keepalive.html
+ACP_WS_PING_INTERVAL = None
+ACP_WS_PING_TIMEOUT = None
+# After session/load, a replayed permission or pending_interaction is for Wade.
+POST_LOAD_INTERACTION_S = 8.0
 
 MessageCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 
@@ -162,6 +178,19 @@ class AcpClient:
         self.last_send_error_at: float | None = None
         self.consecutive_send_failures: int = 0
         self._force_unhealthy_scheduled: bool = False
+        # Keepalive ping timeout while a prompt is in flight. Do not zombie-clear.
+        self._disconnect_keepalive: bool = False
+        self.blip_hold_session_ids: set[str] = set()
+        # Hub broadcasts the plain blip notice. (session_id) -> None or awaitable.
+        self.on_keepalive_blip: Callable[[str], Awaitable[None] | None] | None = None
+        # session_id -> monotonic deadline to surface replayed interactions.
+        self._post_load_until: dict[str, float] = {}
+        # Permission RPCs waiting on the phone (not auto-approved).
+        self._permission_waiters: dict[str, asyncio.Future] = {}
+        # Sessions with a permission or question on screen. Idle clear skips them.
+        self._pending_interaction_sessions: set[str] = set()
+        # (session_id, tool_call_id, future) resolved when grok ends that tool.
+        self._tool_end_waiters: list[tuple[str, str, asyncio.Future]] = []
         # Proactive WS ping probe timestamps (monotonic).
         self.last_probe_at: float | None = None
         self.last_probe_ok_at: float | None = None
@@ -418,7 +447,9 @@ class AcpClient:
         return str(session_id or "") in self.active_turns
 
     def sessions_with_pending_questions(self) -> set[str]:
-        return set(self._pending_user_question_sessions.values())
+        pending = set(self._pending_user_question_sessions.values())
+        pending.update(self._pending_interaction_sessions)
+        return pending
 
     def turn_age_seconds(self, session_id: str | None = None) -> float | None:
         sid = session_id or self.turn_session_id
@@ -600,6 +631,10 @@ class AcpClient:
             meta = self.active_turns[sid]
             started = meta.get("started_at")
             newly = apply_turn_activity(meta, now=now, update_kind=update_kind)
+            # Any ACP traffic resets last_activity. Only a session/update
+            # counts as agent output for the no-output watchdog.
+            if session_stream_kind(update_kind):
+                meta["saw_session_update"] = True
             if newly:
                 ttfb = None
                 if started is not None:
@@ -955,13 +990,24 @@ class AcpClient:
             raise
         except Exception as exc:
             log.debug("ACP recv loop ended: %s", exc)
-            # Fail pending requests so waiters unblock
+            self.note_socket_error(exc)
+            # Fail pending requests so waiters unblock. A keepalive blip keeps
+            # active_turns so session/prompt can session/load after reconnect.
+            blip = self._disconnect_keepalive and bool(self.blip_hold_session_ids)
+            err = (
+                ConnectionError(
+                    "ACP keepalive ping timeout; no close frame received"
+                )
+                if blip
+                else ConnectionError(f"ACP recv ended: {exc}")
+            )
             for fut in list(self._pending.values()):
                 if not fut.done():
-                    fut.set_exception(ConnectionError(f"ACP recv ended: {exc}"))
+                    fut.set_exception(err)
             self._pending.clear()
             self._pending_session.clear()
-            self._cancel_all_pending_user_questions()
+            if not blip:
+                self._cancel_all_pending_user_questions()
 
     async def _maintain(self) -> None:
         backoff = 1.0
@@ -974,11 +1020,19 @@ class AcpClient:
                     host=self.config.agent_bind,
                     port=self.config.agent_port,
                 )
-                async with ws_connect(url, open_timeout=10, max_size=16 * 1024 * 1024) as ws:
+                async with ws_connect(
+                    url,
+                    open_timeout=10,
+                    max_size=16 * 1024 * 1024,
+                    ping_interval=ACP_WS_PING_INTERVAL,
+                    ping_timeout=ACP_WS_PING_TIMEOUT,
+                ) as ws:
                     self._ws = ws
                     # Reader must run before initialize/request awaits responses
                     self._recv_task = asyncio.create_task(self._recv_loop(ws), name="acp-recv")
                     await self._initialize()
+                    # New socket is up. Later send failures are real, not this blip.
+                    self._disconnect_keepalive = False
                     await self._set_connected(True)
                     backoff = 1.0
                     log.info("ACP connected and initialized")
@@ -1001,6 +1055,7 @@ class AcpClient:
                 log.info("ACP recv cancelled (reconnect); maintain continues")
             except Exception as exc:
                 log.warning("ACP connection error: %s", exc)
+                self.note_socket_error(exc)
                 self._trace("disconnect", reason="connection_error", error=str(exc)[:200])
             finally:
                 self._ws = None
@@ -1012,16 +1067,35 @@ class AcpClient:
                 self._load_inflight.clear()
                 # Cancel method may no longer apply after reconnect.
                 self._cancel_method = None
-                if (
+                preserve = self.should_preserve_turn_on_disconnect()
+                if preserve and self.active_turns:
+                    self.blip_hold_session_ids = set(self.active_turns.keys())
+                if preserve:
+                    # Unblock session/prompt so it can reattach. Do not clear
+                    # the turn and do not mark the socket zombie.
+                    for fut in list(self._pending.values()):
+                        if not fut.done():
+                            fut.set_exception(
+                                ConnectionError(
+                                    "ACP keepalive ping timeout; no close frame received"
+                                )
+                            )
+                    self._pending.clear()
+                    self._pending_session.clear()
+                elif (
                     self.active_turns
                     or self._pending
                     or self._pending_user_questions
                 ):
                     # WS already dead: cancel RPC cannot work; unlock locally.
                     self.force_clear_turn("acp disconnected")
+                    self._disconnect_keepalive = False
+                    self.blip_hold_session_ids = set()
                 else:
                     self.active_turns.clear()
                     self._cancel_all_stall_watchdogs()
+                    self._disconnect_keepalive = False
+                    self.blip_hold_session_ids = set()
                 if self._recv_task and not self._recv_task.done():
                     self._recv_task.cancel()
                     try:
@@ -1029,12 +1103,13 @@ class AcpClient:
                     except asyncio.CancelledError:
                         pass
                 self._recv_task = None
-                for fut in list(self._pending.values()):
-                    if not fut.done():
-                        fut.set_exception(ConnectionError("ACP connection closed"))
-                self._pending.clear()
-                self._pending_session.clear()
-                self._cancel_all_pending_user_questions()
+                if not preserve:
+                    for fut in list(self._pending.values()):
+                        if not fut.done():
+                            fut.set_exception(ConnectionError("ACP connection closed"))
+                    self._pending.clear()
+                    self._pending_session.clear()
+                    self._cancel_all_pending_user_questions()
                 if self.connected:
                     self._trace("disconnect", reason="ws_closed")
                     await self._set_connected(False)
@@ -1267,10 +1342,56 @@ class AcpClient:
             log.exception("ACP client request %s failed: %s", method, exc)
             await self._reply_error(msg_id, -32000, f"{type(exc).__name__}: {exc}")
 
+    def mark_post_load(self, session_id: str) -> None:
+        """A just-loaded session may replay an orphaned permission or question."""
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        self._post_load_until[sid] = time.monotonic() + POST_LOAD_INTERACTION_S
+
+    def session_accepts_replayed_interaction(self, session_id: str | None) -> bool:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return False
+        if sid in self._loading_sessions:
+            return True
+        until = self._post_load_until.get(sid)
+        return until is not None and time.monotonic() <= until
+
+    def cancel_permission(self, request_id: str) -> bool:
+        fut = self._permission_waiters.get(str(request_id or ""))
+        if fut is None or fut.done():
+            return False
+        fut.set_result("")
+        return True
+
+    def answer_permission(self, request_id: str, option_id: str) -> bool:
+        """Wade picked an option for a replayed permission. Not auto-approve."""
+        key = str(request_id or "")
+        option = str(option_id or "").strip()
+        fut = self._permission_waiters.get(key)
+        if fut is None or fut.done() or not option:
+            return False
+        fut.set_result(option)
+        return True
+
+    def is_permission_waiter(self, request_id: str) -> bool:
+        fut = self._permission_waiters.get(str(request_id or ""))
+        return fut is not None and not fut.done()
+
     async def _handle_permission(self, msg_id: Any, params: dict[str, Any]) -> None:
         options = params.get("options") or []
         if not isinstance(options, list):
             options = []
+        sid = str(
+            params.get("sessionId") or params.get("session_id") or ""
+        ).strip()
+        # After session/load, grok re-sends the orphaned permission. Show it.
+        # A live turn still uses the existing option picker. --always-approve
+        # on the agent process is unchanged.
+        if sid and self.session_accepts_replayed_interaction(sid):
+            await self._surface_permission(msg_id, params, sid)
+            return
         option_id = pick_permission_option(options)
         tool_call = params.get("toolCall") or params.get("tool_call") or {}
         tool_name = ""
@@ -1291,6 +1412,141 @@ class AcpClient:
             msg_id,
             {"outcome": {"outcome": "selected", "optionId": option_id}},
         )
+
+    async def _surface_permission(
+        self, msg_id: Any, params: dict[str, Any], session_id: str
+    ) -> None:
+        shaped = permission_as_question(params)
+        if shaped is None:
+            log.warning(
+                "replayed permission has no options session=%s", session_id[:12]
+            )
+            await self._reply_error(msg_id, -32602, "permission has no options")
+            return
+        key = str(msg_id)
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._permission_waiters[key] = fut
+        self._pending_interaction_sessions.add(session_id)
+
+        def _drop_pending(_fut: asyncio.Future) -> None:
+            self._pending_interaction_sessions.discard(session_id)
+
+        fut.add_done_callback(_drop_pending)
+        payload = {
+            "requestId": key,
+            "sessionId": session_id,
+            "kind": "permission",
+            "quiet": True,
+            "questions": shaped["questions"],
+            "toolCallId": None,
+        }
+        log.info(
+            "permission surfaced to UI session=%s id=%s", session_id[:12], key
+        )
+        try:
+            if self.on_user_question:
+                cb = self.on_user_question(payload)
+                if asyncio.iscoroutine(cb):
+                    await cb
+            option_id = await asyncio.wait_for(fut, timeout=1800.0)
+        except asyncio.TimeoutError:
+            option_id = ""
+            log.warning("replayed permission timed out id=%s", key)
+        finally:
+            self._permission_waiters.pop(key, None)
+            self._pending_interaction_sessions.discard(session_id)
+        if not option_id:
+            # Do not fall through to auto-approve.
+            await self._reply_error(
+                msg_id, -32800, "permission was not answered"
+            )
+            return
+        await self._reply_result(
+            msg_id,
+            {"outcome": {"outcome": "selected", "optionId": str(option_id)}},
+        )
+
+    async def _surface_pending_interaction(
+        self, session_id: str | None, params: dict[str, Any]
+    ) -> None:
+        described = describe_pending_interaction(params)
+        if described is None:
+            return
+        sid = str(session_id or "").strip()
+        if sid and not self.session_accepts_replayed_interaction(sid):
+            return
+        payload = {
+            "requestId": "",
+            "sessionId": sid or None,
+            "kind": described["kind"],
+            "quiet": True,
+            "title": described["title"],
+            "questions": described["questions"],
+            "options": described["options"],
+        }
+        cb = self.on_user_question
+        if cb is None:
+            return
+        try:
+            result = cb(payload)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:
+            log.debug("pending interaction fanout failed", exc_info=True)
+
+    def _note_tool_end(self, session_id: str | None, update: dict[str, Any]) -> None:
+        if not self._tool_end_waiters or not isinstance(update, dict):
+            return
+        kind = str(update.get("sessionUpdate") or update.get("session_update") or "")
+        sid = str(session_id or "")
+        tool_id = str(update.get("toolCallId") or update.get("tool_call_id") or "")
+        status = None
+        if "status" in update:
+            status = normalize_status(update.get("status"))
+        elif "state" in update:
+            status = normalize_status(update.get("state"))
+        turn_done = kind in ("turn_completed", "task_completed", "prompt_complete")
+        tool_done = kind in ("tool_call", "tool_call_update") and status in (
+            "completed",
+            "failed",
+            "cancelled",
+        )
+        if not turn_done and not tool_done:
+            return
+        still: list[tuple[str, str, asyncio.Future]] = []
+        for wait_sid, wait_tool, fut in self._tool_end_waiters:
+            if fut.done():
+                continue
+            if wait_sid and sid and wait_sid != sid:
+                still.append((wait_sid, wait_tool, fut))
+                continue
+            if wait_tool and tool_id and wait_tool != tool_id and not turn_done:
+                still.append((wait_sid, wait_tool, fut))
+                continue
+            fut.set_result(True)
+        self._tool_end_waiters = still
+
+    async def wait_for_tool_end(
+        self,
+        session_id: str,
+        tool_call_id: str = "",
+        timeout: float = 2.5,
+    ) -> bool:
+        """True when grok emits a tool end or a turn end for this session."""
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        entry = (str(session_id or ""), str(tool_call_id or ""), fut)
+        self._tool_end_waiters.append(entry)
+        try:
+            await asyncio.wait_for(fut, timeout=max(0.2, float(timeout)))
+            return True
+        except asyncio.TimeoutError:
+            return False
+        finally:
+            self._tool_end_waiters = [
+                item for item in self._tool_end_waiters if item[2] is not fut
+            ]
 
     def answer_user_question(self, request_id: str, result: dict[str, Any]) -> bool:
         """Resolve a pending ask_user_question with an ACP result dict."""
@@ -1434,11 +1690,15 @@ class AcpClient:
                 # Always stamp bg activity so orphan subagent_progress after
                 # force-clear still paints Working / sessionFlags (not idle).
                 self.note_bg_activity(sid_str, kind=kind_n or None)
+            if (kind_n or "") == "pending_interaction" and isinstance(params, dict):
+                await self._surface_pending_interaction(sid_str, params)
             return
 
         if method not in ("session/update", "_x.ai/session/update"):
             return
         update = update_pre if update_pre else (params.get("update") or {})
+        if isinstance(update, dict):
+            self._note_tool_end(sid_str, update)
         kind = update.get("sessionUpdate") or ""
         # available_commands still applied during load (helper allows this kind).
         if kind == "available_commands_update":
@@ -1506,14 +1766,21 @@ class AcpClient:
         try:
             await ws.send(json.dumps(payload))
         except Exception as exc:
-            self.consecutive_send_failures += 1
-            self.last_send_error_at = time.monotonic()
+            blip = self._send_is_keepalive_blip(exc)
             self._trace(
                 "send_fail",
                 method=str(method)[:80] if method else None,
                 consecutive_failures=self.consecutive_send_failures,
                 error=str(exc)[:200],
+                keepalive_blip=blip,
             )
+            if blip:
+                # Busy agent missed a pong. Reconnect reattaches the prompt.
+                # Do not count this toward zombie / force_unhealthy.
+                self.note_socket_error(exc)
+                raise
+            self.consecutive_send_failures += 1
+            self.last_send_error_at = time.monotonic()
             if self.consecutive_send_failures >= 2:
                 self._schedule_force_unhealthy(reason="send_failures")
             raise
@@ -1591,12 +1858,93 @@ class AcpClient:
         self._warm_sessions.add(sid)
         return sid
 
-    async def session_load(self, session_id: str, cwd: str) -> Any:
+    def note_socket_error(self, exc: BaseException) -> None:
+        """Remember a close so a live prompt is reattached, not zombie-cleared.
+
+        A 1011 ping timeout and a ConnectionClosed both reconnect. The ping
+        timeout is usually the hub loop failing to pong, not Grok being busy.
+        """
+        if not (is_keepalive_ping_timeout(exc) or is_connection_closed(exc)):
+            return
+        self._disconnect_keepalive = True
+        if self.active_turns:
+            self.blip_hold_session_ids = set(self.active_turns.keys())
+
+    def should_preserve_turn_on_disconnect(self) -> bool:
+        return bool(
+            self._disconnect_keepalive
+            and (self.active_turns or self.blip_hold_session_ids)
+        )
+
+    def _prompt_pending(self) -> bool:
+        return bool(self.active_turns or self._pending)
+
+    def _send_is_keepalive_blip(self, exc: BaseException) -> bool:
+        if not self._prompt_pending():
+            return False
+        return is_keepalive_ping_timeout(exc) or self._disconnect_keepalive
+
+    async def _wait_until_connected(self, timeout: float = 20.0) -> None:
+        deadline = time.monotonic() + max(0.5, float(timeout))
+        while time.monotonic() < deadline:
+            if self.connected and self._ws is not None:
+                return
+            await asyncio.sleep(0.05)
+        raise TimeoutError("ACP reconnect timed out after keepalive blip")
+
+    async def _await_reattached_turn(self, session_id: str) -> None:
+        """Wait until session/update says the reattached turn finished."""
+        meta = self.active_turns.get(session_id) or {}
+        started = meta.get("started_at")
+        start = float(started) if started is not None else time.monotonic()
+        deadline = start + float(MAX_TURN_SECONDS)
+        while session_id in self.active_turns:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("max turn duration")
+            await asyncio.sleep(0.05)
+
+    async def _notify_keepalive_blip(self, session_id: str) -> None:
+        cb = self.on_keepalive_blip
+        if cb is None:
+            return
+        try:
+            result = cb(session_id)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:
+            log.debug("keepalive blip notify failed", exc_info=True)
+
+    async def _reattach_after_keepalive(self, session_id: str, cwd: str | None) -> None:
+        """Reconnect is the maintain loop. Then session/load the same id."""
+        self._trace(
+            "prompt_blip",
+            sessionId=session_id_slice(session_id),
+            hold=len(self.blip_hold_session_ids),
+        )
+        await self._notify_keepalive_blip(session_id)
+        await self._wait_until_connected()
+        folder = str(cwd or "").strip()
+        if not folder:
+            raise RuntimeError("cwd required to reattach after keepalive blip")
+        self.forget_warm_session(session_id)
+        await self.session_load(session_id, folder, allow_during_turn=True)
+        self.blip_hold_session_ids.discard(session_id)
+        self._trace("reattach_ok", sessionId=session_id_slice(session_id))
+        await self._await_reattached_turn(session_id)
+
+    async def session_load(
+        self,
+        session_id: str,
+        cwd: str,
+        *,
+        allow_during_turn: bool = False,
+    ) -> Any:
         sid = str(session_id)
         # Already loaded in this process: skip agent session/load (not model prefill).
         if should_skip_session_load(self._warm_sessions, sid):
             log.info("session/load skip already warm sid=%s", sid[:8])
             self.loaded_session_id = sid
+            self.mark_post_load(sid)
             return {"skipped": True, "sessionId": sid}
         # Concurrent attach/ensure: join in-flight load for same sid (one RPC).
         inflight = self._load_inflight.get(sid)
@@ -1607,7 +1955,8 @@ class AcpClient:
         self._load_inflight[sid] = fut
         try:
             # Only block load of this session if it is mid-turn (not other projects).
-            if session_id in self.active_turns:
+            # Reattach after a keepalive blip loads while that turn is still active.
+            if session_id in self.active_turns and not allow_during_turn:
                 if self.is_turn_stuck(session_id=session_id):
                     await self.end_turn(session_id, "stuck turn before session/load")
                 else:
@@ -1625,6 +1974,7 @@ class AcpClient:
                 )
                 self.loaded_session_id = session_id
                 self._warm_sessions.add(sid)
+                self.mark_post_load(sid)
             finally:
                 # Quiet-period release: agent may flush historical frames for many
                 # seconds after the RPC result. Keep sid in _loading_sessions; each
@@ -1785,8 +2135,15 @@ class AcpClient:
                 age_activity = (
                     (now - float(activity_at)) if activity_at is not None else age_start
                 )
+                if session_id in self._pending_interaction_sessions:
+                    # Wade is answering a replayed permission or question.
+                    continue
+                # Idle timer: age_since_activity resets on any ACP traffic.
+                # saw_session_update stays false until a real session/update,
+                # so a silent prompt still clears at about 60s. A turn that
+                # already streamed uses the longer stall, then the cap.
                 reason = should_force_clear_turn(
-                    bool(meta.get("saw_update")),
+                    bool(meta.get("saw_session_update")),
                     age_start,
                     age_activity,
                     no_output_seconds=no_output_seconds,
@@ -1935,6 +2292,27 @@ class AcpClient:
             self._trace("prompt_end", sessionId=session_id_slice(session_id), ok=True)
             return result
         except Exception as exc:
+            blip = is_keepalive_ping_timeout(exc) or (
+                self._disconnect_keepalive and session_id in self.active_turns
+            )
+            if blip:
+                try:
+                    await self._reattach_after_keepalive(session_id, cwd)
+                    log.info("Prompt end session=%s ok after keepalive reattach", session_id)
+                    self._trace(
+                        "prompt_end",
+                        sessionId=session_id_slice(session_id),
+                        ok=True,
+                        via="reattach",
+                    )
+                    return {"reattached": True}
+                except Exception as recover_exc:
+                    log.warning(
+                        "Prompt reattach failed session=%s: %s",
+                        session_id,
+                        recover_exc,
+                    )
+                    exc = recover_exc
             log.warning("Prompt end session=%s error: %s", session_id, exc)
             self._trace(
                 "prompt_end",
@@ -1942,6 +2320,9 @@ class AcpClient:
                 ok=False,
                 error=str(exc)[:200],
             )
+            # Plain sentence for the UI. A real max-turn timeout stays as-is.
+            if blip and "max turn duration" not in str(exc).lower():
+                raise RuntimeError(ACP_BLIP_USER_MSG) from exc
             raise
         finally:
             self._clear_active_turn(session_id)

@@ -36,6 +36,19 @@ from hub.site_preview import (
     build_preview_plan,
 )
 from hub.history import load_session_history
+from hub.turn_recover import (
+    LOAD_AFTER_RESTART_MSG,
+    OTHER_SESSIONS_MSG,
+    REATTACHED_MSG,
+    RELOADED_MSG,
+    RESTART_FAILED_MSG,
+    RESTARTING_SESSION_MSG,
+    UNRESUMABLE_RESTART_MSG,
+    clearing_message,
+    find_dangling_turn,
+    wedged_no_output_message,
+)
+from hub.http_auth import HUB_TOKEN_COOKIE, stamp_token_on_asset_urls, token_accepted
 from hub.plan_view import PlanViewError, apply_plan_action, read_session_plan
 from hub.projects import ProjectError, create_project, list_project_browse
 from hub.multi_turn import (
@@ -74,12 +87,14 @@ from hub.status_view import (
 from hub.acp_trace import session_id_slice
 from hub.session_signals import read_session_signals, read_signals_file, find_signals_path
 from hub.session_policy import (
+    ACP_BLIP_USER_MSG,
     HOT_PATH_MAX_HUB_PRE_PROMPT_S,
     NO_OUTPUT_RETRY_SECONDS,
     STUCK_TURN_SECONDS,
     bg_activity_label,
     cwd_key,
     is_hub_resume_candidate,
+    is_keepalive_ping_timeout,
     is_live_hot_path,
     is_no_output_error_message,
     is_permanent_session_load_failure,
@@ -96,6 +111,24 @@ from hub.session_policy import (
 from hub.session_tailer import EventDedupe, SessionTailer
 from hub.skills_index import list_skills
 from hub.version_info import HUB_VERSION, get_cli_version, structural_compat
+from hub.archive import ArchiveError, ArchiveStore, archive_catalog_item, restore_catalog_item
+from hub.build_actions import BuildActionError, chat_path, execute_build_action
+from hub.notify_feed import NotifyFeed, classify_turn_notify
+from hub.build_index import (
+    DEFAULT_INDEX_LIMIT,
+    build_catalog,
+    find_catalog_item,
+    grok_home_from_sessions,
+)
+from hub.build_summaries import SummaryStore, item_key, refresh_item_summary
+from hub.worktree_remove import WorktreeRemoveError, parse_force, remove_catalog_worktree
+from hub.app_update import (
+    UpdateManifestError,
+    read_manifest,
+    resolve_update_apk,
+    sanitize_channel,
+    updates_root,
+)
 
 log = logging.getLogger("hub.server")
 
@@ -106,17 +139,17 @@ REMOTE_SESSION_SYSTEM_NOTE = (
 )
 REMOTE_SESSION_SAME_NOTE = "Live remote session"
 NO_OUTPUT_USER_MSG = (
-    "Agent produced no output. Same session kept — send again."
+    "Agent produced no output. Same session kept. Send again."
 )
-NO_OUTPUT_RECOVERING_MSG = "Recovering session — retrying…"
+NO_OUTPUT_RECOVERING_MSG = "Recovering session. Retrying."
 NO_OUTPUT_RETRY_FAILED_MSG = (
     "Agent still not responding after automatic retry. Try again in a moment."
 )
 MID_TURN_STALL_USER_MSG = (
-    "Agent stalled mid-turn (no activity). Turn cleared — you can send again."
+    "Agent stalled mid-turn with no activity. Turn cleared. You can send again."
 )
 MAX_TURN_USER_MSG = (
-    "Turn hit max duration and was cleared — you can send again."
+    "Turn hit max duration and was cleared. You can send again."
 )
 
 
@@ -234,6 +267,13 @@ class Hub:
         self.hub_owned_session_ids: set[str] = set()
         # Permanent session/load failures (missing path / FS_NOT_FOUND) — never re-prefer.
         self._unresumable_session_ids: set[str] = set()
+        # Sessions whose transcript tail was already scanned for a dangling turn.
+        # Cleared on a successful session/load so the next resume rechecks once.
+        self._dangling_checked: set[str] = set()
+        # Sessions that had a pending tool or interrupted turn. A later silent
+        # prompt offers Restart this session with a plain explanation.
+        self._wedged_sessions: set[str] = set()
+        self._wedged_reason: dict[str, str] = {}
         # Single-flight ensure per cwd_key (concurrent attach/prompt share one ensure).
         self._ensure_locks: dict[str, asyncio.Lock] = {}
         # cwd (casefold) -> last hub-created agent session id for remote prompts.
@@ -252,6 +292,12 @@ class Hub:
         # Hub-owned /compact gate: sid → monotonic deadline (in-flight + post grace).
         # While active, notification path skips terminal/started compact broadcasts.
         self._hub_compact_gate: dict[str, float] = {}
+        self.summary_store = SummaryStore(PROJECT_ROOT / "data" / "build_summaries.json")
+        self.archive_store = ArchiveStore(PROJECT_ROOT / "data" / "archive.json")
+        # Phone long-poll. In memory only. Same hub_token as every other route.
+        self.notify_feed = NotifyFeed()
+        self._summary_task: asyncio.Task | None = None
+        self._summary_force: set[str] = set()
         self.cli_version: str | None = None
         self.compat: dict[str, Any] = {
             "ok": False,
@@ -605,14 +651,29 @@ class Hub:
         else:
             if self._acp_disconnected_at is None:
                 self._acp_disconnected_at = time.monotonic()
-            # Prior process-local session/new ids are dead after ACP drop.
-            # Keep remote_agent_session for UI badges; next ensure will session/new.
-            if self.acp_created_sessions:
+            # A keepalive blip keeps the in-flight ids so ensure does not
+            # session/new over a turn the agent is still running.
+            hold = {
+                str(sid)
+                for sid in (getattr(self.acp, "blip_hold_session_ids", set()) or set())
+                if str(sid)
+            }
+            if hold:
+                kept = {sid for sid in self.acp_created_sessions if sid in hold}
+                self.acp_created_sessions = kept | hold
                 log.info(
-                    "ACP disconnected; clearing %d agent-live session id(s)",
-                    len(self.acp_created_sessions),
+                    "ACP keepalive blip; keeping %d in-flight session id(s)",
+                    len(hold),
                 )
-            self.acp_created_sessions.clear()
+            else:
+                # Prior process-local session/new ids are dead after ACP drop.
+                # Keep remote_agent_session for UI badges; next ensure will session/new.
+                if self.acp_created_sessions:
+                    log.info(
+                        "ACP disconnected; clearing %d agent-live session id(s)",
+                        len(self.acp_created_sessions),
+                    )
+                self.acp_created_sessions.clear()
             sids = list(self.acp.disconnect_turn_session_ids or [])
             self.acp.disconnect_turn_session_ids = []
             sid = self.acp.disconnect_turn_session_id
@@ -620,8 +681,12 @@ class Hub:
             if sid and sid not in sids:
                 sids.append(sid)
             if not sids and self.acp.turn_session_id:
-                sids.append(self.acp.turn_session_id)
+                primary = self.acp.turn_session_id
+                if primary not in hold:
+                    sids.append(primary)
             for cleared in sids:
+                if cleared in hold:
+                    continue
                 await self.broadcast(
                     {
                         "type": "turn",
@@ -630,6 +695,16 @@ class Hub:
                         "error": "ACP disconnected",
                     },
                     session_id=cleared,
+                )
+            for kept_sid in hold:
+                await self.broadcast(
+                    {
+                        "type": "turn",
+                        "sessionId": kept_sid,
+                        "state": "running",
+                        "error": ACP_BLIP_USER_MSG,
+                    },
+                    session_id=kept_sid,
                 )
         await self.broadcast(self.status_payload())
 
@@ -652,8 +727,13 @@ class Hub:
                 "sessionId": session_id,
                 "questions": payload.get("questions") or [],
                 "toolCallId": payload.get("toolCallId"),
+                "kind": payload.get("kind") or "question",
+                "title": payload.get("title") or "",
+                "quiet": bool(payload.get("quiet")),
             }
         )
+        if session_id:
+            self._publish_notify(str(session_id), "pending_question", "question")
         # Refresh sessionFlags / pendingQuestionSessions so rail shows question.
         await self.broadcast(self.status_payload())
 
@@ -785,6 +865,35 @@ class Hub:
         answers = payload.get("answers") or {}
         if not isinstance(answers, dict):
             answers = {}
+        if self.acp.is_permission_waiter(request_id):
+            option_id = ""
+            raw_perm = answers.get("permission")
+            if isinstance(raw_perm, list) and raw_perm:
+                option_id = str(raw_perm[0] or "")
+            elif isinstance(raw_perm, str):
+                option_id = raw_perm
+            if not option_id:
+                for value in answers.values():
+                    if isinstance(value, list) and value:
+                        option_id = str(value[0] or "")
+                        break
+                    if isinstance(value, str) and value:
+                        option_id = value
+                        break
+            if outcome == "cancelled":
+                ok = self.acp.cancel_permission(request_id)
+            else:
+                ok = self.acp.answer_permission(request_id, option_id)
+            await self.broadcast(
+                {
+                    "type": "user_question_resolved",
+                    "requestId": request_id,
+                    "outcome": "cancelled" if outcome == "cancelled" else "accepted",
+                    "ok": ok,
+                }
+            )
+            await self.broadcast(self.status_payload())
+            return
         if outcome == "cancelled":
             ok = self.acp.cancel_user_question(request_id)
         else:
@@ -1107,15 +1216,37 @@ class Hub:
         # lines written while the socket was down (offsets stay mid-file).
 
     def check_auth(self, request: web.Request) -> bool:
-        token = self.config.hub_token
+        token = self.config.hub_token or ""
+        return token_accepted(
+            token,
+            authorization=request.headers.get("Authorization") or "",
+            query_token=request.rel_url.query.get("token") or "",
+            cookie_token=request.cookies.get(HUB_TOKEN_COOKIE) or "",
+        )
+
+    def _maybe_set_token_cookie(self, request: web.Request, response: web.StreamResponse) -> None:
+        """Remember a token the request already proved, for CSS, JS, and fonts.
+
+        WebView and browser subresources do not copy ``?token=`` from the page
+        URL. The cookie is the same secret, not a second way in.
+        """
+        token = self.config.hub_token or ""
         if not token:
-            return True
-        auth = request.headers.get("Authorization") or ""
-        if auth.lower().startswith("bearer ") and auth[7:].strip() == token:
-            return True
-        if request.rel_url.query.get("token") == token:
-            return True
-        return False
+            return
+        if (request.cookies.get(HUB_TOKEN_COOKIE) or "") == token:
+            return
+        try:
+            response.set_cookie(
+                HUB_TOKEN_COOKIE,
+                token,
+                max_age=60 * 60 * 24 * 30,
+                path="/",
+                httponly=True,
+                samesite="Lax",
+                secure=False,
+            )
+        except Exception:
+            log.debug("could not set hub token cookie", exc_info=True)
 
     @staticmethod
     def _cwd_key(cwd: str) -> str:
@@ -1261,6 +1392,8 @@ class Hub:
                 self.acp.session_load(session_id, cwd),
                 timeout=20.0,
             )
+            # Resume rechecks the transcript once. Hot reuse does not.
+            self._dangling_checked.discard(str(session_id or "").strip())
             return True
         except Exception as exc:
             log.warning("session/load failed for %s: %s", session_id, exc)
@@ -1619,6 +1752,13 @@ class Hub:
         app.router.add_get("/api/compat", self.handle_compat)
         app.router.add_post("/api/compat/refresh", self.handle_compat_refresh)
         app.router.add_get("/api/sessions", self.handle_sessions)
+        app.router.add_get("/api/notify/poll", self.handle_notify_poll)
+        app.router.add_get("/api/build/index", self.handle_build_index)
+        app.router.add_post("/api/build/summaries/refresh", self.handle_build_summaries_refresh)
+        app.router.add_post("/api/build/resume", self.handle_build_resume)
+        app.router.add_post("/api/build/archive", self.handle_build_archive)
+        app.router.add_post("/api/build/restore", self.handle_build_restore)
+        app.router.add_post("/api/build/worktree/remove", self.handle_build_worktree_remove)
         app.router.add_get("/api/sessions/{id}/history", self.handle_history)
         app.router.add_get("/api/sessions/{id}/plan", self.handle_session_plan)
         app.router.add_post("/api/sessions/{id}/plan/action", self.handle_session_plan_action)
@@ -1628,6 +1768,9 @@ class Hub:
         app.router.add_patch("/api/sessions/{id}", self.handle_rename_session)
         app.router.add_delete("/api/sessions/{id}", self.handle_delete_session)
         app.router.add_post("/api/sessions/{id}/load", self.handle_load_session)
+        app.router.add_post(
+            "/api/sessions/{id}/restart-turn", self.handle_restart_turn
+        )
         app.router.add_post("/api/sessions/{id}/attach", self.handle_attach_session)
         app.router.add_post("/api/admin/reset-turn", self.handle_reset_turn)
         app.router.add_post("/api/admin/reconnect-acp", self.handle_reconnect_acp)
@@ -1651,6 +1794,10 @@ class Hub:
         app.router.add_get("/preview-site/", self.handle_preview_site)
         app.router.add_get("/preview-site/{path:.*}", self.handle_preview_site)
         app.router.add_get("/ws", self.handle_ws)
+        # Register before static / so update paths are not swallowed.
+        # These stay behind hub_token. /health is still the only skip.
+        app.router.add_get("/app/update.json", self.handle_app_update_manifest)
+        app.router.add_get("/app/{filename}", self.handle_app_update_apk)
         static_dir = Path(self.config.static_dir)
         if static_dir.is_dir():
             app.router.add_get("/", self.handle_index)
@@ -1667,7 +1814,9 @@ class Hub:
             return await handler(request)
         if not self.check_auth(request):
             return web.json_response({"error": "unauthorized"}, status=401)
-        return await handler(request)
+        response = await handler(request)
+        self._maybe_set_token_cookie(request, response)
+        return response
 
     async def _on_startup(self, app: web.Application) -> None:
         # CLI version is cheap and useful even if agent is slow
@@ -1694,6 +1843,9 @@ class Hub:
         self._status_resync_task = asyncio.create_task(
             self._status_resync_loop(), name="hub-status-resync"
         )
+        self._summary_task = asyncio.create_task(
+            self._summary_refresh_loop(), name="hub-summary-refresh"
+        )
         try:
             self.ops.emit(
                 "hub_start",
@@ -1719,6 +1871,14 @@ class Hub:
             task.cancel()
             try:
                 await task
+            except asyncio.CancelledError:
+                pass
+        summary_task = self._summary_task
+        self._summary_task = None
+        if summary_task is not None and not summary_task.done():
+            summary_task.cancel()
+            try:
+                await summary_task
             except asyncio.CancelledError:
                 pass
         self.site_preview.stop()
@@ -1760,14 +1920,26 @@ class Hub:
                     if sid and not self.acp.is_session_active(sid):
                         err = MID_TURN_STALL_USER_MSG
                         low = reason.lower()
+                        recovery = None
                         if "max turn" in low:
                             err = MAX_TURN_USER_MSG
                         elif "no acp session/update" in low:
-                            err = NO_OUTPUT_USER_MSG
-                        try:
-                            await self._broadcast_turn(sid, "idle", err)
-                        except Exception:
-                            log.debug("status resync turn idle broadcast failed", exc_info=True)
+                            if sid in self._wedged_sessions:
+                                # The prompt handler restarts this session.
+                                # Do not also show "send again".
+                                err = ""
+                            else:
+                                err = NO_OUTPUT_USER_MSG
+                        if err:
+                            try:
+                                await self._broadcast_turn(
+                                    sid, "idle", err, recovery=recovery
+                                )
+                            except Exception:
+                                log.debug(
+                                    "status resync turn idle broadcast failed",
+                                    exc_info=True,
+                                )
                 bg_now = self.acp.live_bg_activity_sessions()
                 still_active = (
                     self.acp.turn_running
@@ -1937,8 +2109,24 @@ class Hub:
                 except Exception:
                     log.debug("ACP heal exhausted status broadcast failed", exc_info=True)
 
-    async def handle_index(self, request: web.Request) -> web.FileResponse:
-        return web.FileResponse(Path(self.config.static_dir) / "index.html")
+    async def handle_index(self, request: web.Request) -> web.Response:
+        """Serve the UI. Stamp hub_token onto asset URLs when the page proved it.
+
+        A phone WebView loads ``/?open=&embed=chat&token=``. The stylesheet and
+        script tags would otherwise be unauthorized, so the embedded chat stays
+        on Connecting with no session selected.
+        """
+        path = Path(self.config.static_dir) / "index.html"
+        html = await asyncio.to_thread(path.read_text, encoding="utf-8")
+        token = str(self.config.hub_token or "")
+        if token:
+            html = stamp_token_on_asset_urls(html, token)
+        return web.Response(
+            text=html,
+            content_type="text/html",
+            charset="utf-8",
+            headers={"Cache-Control": "no-store"},
+        )
 
     def _health_body(self) -> dict[str, Any]:
         """Shared health fields for /health and diagnostics."""
@@ -2010,6 +2198,26 @@ class Hub:
             body["acpTraceRecent"] = []
         return body
 
+    async def handle_notify_poll(self, request: web.Request) -> web.Response:
+        """Long-poll turn_end and pending_question events for the phone.
+
+        ``since`` is the last id the client already applied. ``since=-1`` returns
+        the cursor and no events, so a first connect does not replay old turns.
+        ``wait`` seconds (max 25) holds the request until an event or the timeout.
+        """
+        raw_since = request.query.get("since", "0")
+        raw_wait = request.query.get("wait", "20")
+        try:
+            since = int(raw_since)
+        except (TypeError, ValueError):
+            since = 0
+        try:
+            wait = float(raw_wait)
+        except (TypeError, ValueError):
+            wait = 20.0
+        events, cursor = await self.notify_feed.poll(since, wait)
+        return web.json_response({"cursor": cursor, "events": events})
+
     async def handle_health(self, request: web.Request) -> web.Response:
         return web.json_response(self._health_body())
 
@@ -2051,20 +2259,25 @@ class Hub:
 
         watch: dict[str, Any] | None = None
         watch_path = log_dir / "watch-hub-state.json"
+
+        def _read_watch() -> dict[str, Any] | None:
+            if not watch_path.is_file():
+                return None
+            raw = watch_path.read_text(encoding="utf-8-sig")
+            parsed = json.loads(raw)
+            if not isinstance(parsed, dict):
+                return None
+            return {
+                k: v
+                for k, v in parsed.items()
+                if not any(
+                    s in str(k).lower()
+                    for s in ("secret", "token", "password", "authorization")
+                )
+            }
+
         try:
-            if watch_path.is_file():
-                raw = watch_path.read_text(encoding="utf-8-sig")
-                parsed = json.loads(raw)
-                if isinstance(parsed, dict):
-                    # Never surface secrets if a future schema adds them.
-                    watch = {
-                        k: v
-                        for k, v in parsed.items()
-                        if not any(
-                            s in str(k).lower()
-                            for s in ("secret", "token", "password", "authorization")
-                        )
-                    }
+            watch = await asyncio.to_thread(_read_watch)
         except Exception:
             log.debug("diagnostics watch state read failed", exc_info=True)
             watch = None
@@ -2379,8 +2592,616 @@ class Hub:
             body["error"] = err
         return web.json_response(body, status=200 if ok else 502)
 
+    def _updates_jsonl_path(self, session_id: str) -> Path | None:
+        try:
+            info = find_session(self.config.sessions_root, session_id)
+        except Exception:
+            log.debug("dangling lookup failed", exc_info=True)
+            return None
+        if info is None or not info.path:
+            return None
+        path = Path(info.path) / "updates.jsonl"
+        try:
+            if path.is_file():
+                return path
+        except OSError:
+            return None
+        return None
+
+    def _clear_wedged(self, session_id: str) -> None:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        self._wedged_sessions.discard(sid)
+        self._wedged_reason.pop(sid, None)
+
+    def _wedged_failure_payload(self, session_id: str) -> tuple[str, str | None]:
+        """Plain no-output copy plus recovery flag, when this session was dangling."""
+        sid = str(session_id or "").strip()
+        if sid not in self._wedged_sessions:
+            return "", None
+        reason = self._wedged_reason.get(sid) or "pending_tool"
+        return wedged_no_output_message(reason), "restart_session"
+
+    def _other_turns_active(self, session_id: str) -> bool:
+        sid = str(session_id or "").strip()
+        for other in self.acp.turn_session_ids:
+            if other and other != sid:
+                return True
+        return False
+
+    async def _notify_cancel_bounded(self, session_id: str) -> bool:
+        """session/cancel with a short cap so a dead agent cannot stall the prompt."""
+        try:
+            return bool(
+                await asyncio.wait_for(
+                    self.acp.notify_agent_cancel(session_id),
+                    timeout=2.0,
+                )
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "dangling cancel timed out session=%s", str(session_id)[:12]
+            )
+            return False
+        except Exception as exc:
+            log.warning(
+                "dangling cancel failed session=%s: %s",
+                str(session_id)[:12],
+                exc,
+            )
+            return False
+
+    async def _cwd_for_session(self, session_id: str, cwd: str = "") -> str:
+        folder = (cwd or "").strip()
+        if folder:
+            return folder
+        try:
+            info = await asyncio.to_thread(
+                find_session, self.config.sessions_root, session_id
+            )
+        except Exception:
+            info = None
+        if info is not None:
+            return str(info.cwd or "").strip()
+        return ""
+
+    async def _confirm_dangling_cancel(
+        self, session_id: str, tool_call_id: str, cwd: str
+    ) -> bool:
+        """session/cancel, then require a tool end. Otherwise session/load.
+
+        Returns True only when grok accepted the cancel and emitted an end.
+        A silent cancel still reloads the session so the one prompt is not
+        sent into an orphaned in-memory turn.
+        """
+        accepted = await self._notify_cancel_bounded(session_id)
+        ended = False
+        if accepted and self.acp.connected:
+            ended = await self.acp.wait_for_tool_end(
+                session_id, tool_call_id or "", timeout=2.5
+            )
+        if ended:
+            return True
+        log.warning(
+            "dangling cancel not confirmed session=%s accepted=%s; session/load",
+            session_id[:12],
+            accepted,
+        )
+        folder = await self._cwd_for_session(session_id, cwd)
+        if folder and not self.acp.is_session_active(session_id):
+            self.acp.forget_warm_session(session_id)
+            await self._try_session_load(session_id, folder)
+        return False
+
+    async def _cancel_dangling_before_prompt(
+        self, session_id: str, view_session_id: str, cwd: str = ""
+    ) -> bool:
+        """If the transcript is unfinished, session/cancel before session/prompt.
+
+        Scans once per session until the next successful session/load. A session
+        that already has a hub turn is left alone (session/prompt refuses it).
+        Returns True when a dangling turn was found.
+        """
+        sid = str(session_id or "").strip()
+        if not sid:
+            return False
+        if self.acp.is_session_active(sid):
+            return False
+        if sid in self._dangling_checked:
+            if sid not in self._wedged_sessions:
+                return False
+            await self._confirm_dangling_cancel(sid, "", cwd)
+            return True
+
+        self._dangling_checked.add(sid)
+        path = self._updates_jsonl_path(sid)
+        dangling = (
+            await asyncio.to_thread(find_dangling_turn, path)
+            if path is not None
+            else None
+        )
+        if dangling is None:
+            self._clear_wedged(sid)
+            return False
+
+        already = sid in self._wedged_sessions
+        self._wedged_sessions.add(sid)
+        self._wedged_reason[sid] = dangling.reason
+        log.warning(
+            "dangling turn session=%s reason=%s label=%s; session/cancel before prompt",
+            sid[:12],
+            dangling.reason,
+            (dangling.label or "")[:80],
+        )
+        await self._confirm_dangling_cancel(sid, dangling.tool_call_id, cwd)
+        if not already:
+            await self._broadcast_turn(
+                sid,
+                "running",
+                clearing_message(dangling.reason, dangling.label),
+                also_session_id=view_session_id,
+                quiet_notify=True,
+            )
+        return True
+
+    async def _recover_wedged_silence(
+        self, session_id: str, view_session_id: str, cwd: str
+    ) -> None:
+        """No session/update after cancel and one prompt. Do not send it again.
+
+        Restart grok agent serve only when no other session is mid-turn, then
+        session/load that same id in the new process.
+        """
+        sid = str(session_id or "").strip()
+        if self.acp.last_force_clear_reason:
+            self._last_broadcast_force_clear = self.acp.last_force_clear_reason
+        if self._other_turns_active(sid):
+            await self._broadcast_turn(
+                sid,
+                "idle",
+                OTHER_SESSIONS_MSG,
+                also_session_id=view_session_id,
+                recovery="restart_session",
+            )
+            return
+        await self._broadcast_turn(
+            sid,
+            "running",
+            RESTARTING_SESSION_MSG,
+            also_session_id=view_session_id,
+            quiet_notify=True,
+        )
+        folder = await self._cwd_for_session(sid, cwd)
+        ok, err = await self._restart_agent_process(
+            reason=f"restart wedged session {sid[:12]}",
+            broadcast_error=(
+                "Restarting this session. Other sessions were not in a turn."
+            ),
+        )
+        if not ok:
+            await self._broadcast_turn(
+                sid,
+                "idle",
+                RESTART_FAILED_MSG,
+                also_session_id=view_session_id,
+                recovery="restart_session",
+            )
+            if err:
+                log.warning("wedged restart failed session=%s: %s", sid[:12], err)
+            return
+        self.acp.forget_warm_session(sid)
+        self._dangling_checked.discard(sid)
+        loaded = await self._try_session_load(sid, folder) if folder else False
+        if loaded:
+            if folder:
+                self._record_hub_session(sid, folder)
+            self._clear_wedged(sid)
+            await self._broadcast_turn(
+                sid,
+                "idle",
+                REATTACHED_MSG,
+                also_session_id=view_session_id,
+                quiet_notify=True,
+            )
+            return
+        await self._broadcast_turn(
+            sid,
+            "idle",
+            LOAD_AFTER_RESTART_MSG,
+            also_session_id=view_session_id,
+            recovery="restart_session",
+        )
+
+    async def _restart_wedged_session(self, session_id: str, cwd: str) -> dict[str, Any]:
+        """Reload one wedged session. Does not start a new session.
+
+        session/cancel, drop warm state, session/load the same id. The shared
+        Grok process is restarted only when that load fails and no other
+        session is in a turn.
+        """
+        sid = str(session_id or "").strip()
+        if not sid:
+            return {"ok": False, "mode": "missing", "message": "sessionId required"}
+        folder = (cwd or "").strip()
+        if not folder:
+            try:
+                info = find_session(self.config.sessions_root, sid)
+            except Exception:
+                info = None
+            if info is not None:
+                folder = str(info.cwd or "").strip()
+
+        await self._notify_cancel_bounded(sid)
+        if self.acp.is_session_active(sid):
+            await self.acp.end_turn(sid, "restart this session")
+        self.acp.forget_warm_session(sid)
+        self._dangling_checked.discard(sid)
+
+        loaded = await self._try_session_load(sid, folder)
+        if loaded:
+            if folder:
+                self._record_hub_session(sid, folder)
+            self._clear_wedged(sid)
+            await self._broadcast_turn(
+                sid, "idle", RELOADED_MSG, quiet_notify=True
+            )
+            return {"ok": True, "mode": "reload", "message": RELOADED_MSG}
+
+        if sid in self._unresumable_session_ids:
+            await self._broadcast_turn(sid, "idle", UNRESUMABLE_RESTART_MSG)
+            return {
+                "ok": False,
+                "mode": "unresumable",
+                "message": UNRESUMABLE_RESTART_MSG,
+            }
+
+        if self._other_turns_active(sid):
+            await self._broadcast_turn(sid, "idle", OTHER_SESSIONS_MSG)
+            return {
+                "ok": False,
+                "mode": "others_running",
+                "message": OTHER_SESSIONS_MSG,
+            }
+
+        ok, err = await self._restart_agent_process(
+            reason=f"restart wedged session {sid[:12]}",
+            broadcast_error=(
+                "Restarting this session. Other sessions were not in a turn."
+            ),
+        )
+        if not ok:
+            await self._broadcast_turn(sid, "idle", RESTART_FAILED_MSG)
+            body = {
+                "ok": False,
+                "mode": "restart_failed",
+                "message": RESTART_FAILED_MSG,
+            }
+            if err:
+                body["error"] = err
+            return body
+
+        self.acp.forget_warm_session(sid)
+        self._dangling_checked.discard(sid)
+        loaded = await self._try_session_load(sid, folder)
+        if loaded:
+            if folder:
+                self._record_hub_session(sid, folder)
+            self._clear_wedged(sid)
+            await self._broadcast_turn(
+                sid, "idle", REATTACHED_MSG, quiet_notify=True
+            )
+            return {"ok": True, "mode": "reattach", "message": REATTACHED_MSG}
+
+        await self._broadcast_turn(sid, "idle", LOAD_AFTER_RESTART_MSG)
+        return {
+            "ok": False,
+            "mode": "load_after_restart_failed",
+            "message": LOAD_AFTER_RESTART_MSG,
+        }
+
+    async def handle_restart_turn(self, request: web.Request) -> web.Response:
+        """One session reload. Same hub_token as every other route. Never session/new."""
+        session_id = request.match_info["id"]
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        cwd = str(body.get("cwd") or "")
+        result = await self._restart_wedged_session(session_id, cwd)
+        status = 200 if result.get("ok") else 409
+        return web.json_response(result, status=status)
+
     async def handle_sessions(self, request: web.Request) -> web.Response:
         return web.json_response({"items": self._sessions_items_with_status()})
+
+    def _grok_home(self) -> Path:
+        return grok_home_from_sessions(self.config.sessions_root)
+
+    async def handle_app_update_manifest(self, request: web.Request) -> web.Response:
+        """Published sideload manifest. Missing file is 404, not an open route."""
+        channel = request.rel_url.query.get("channel") or "stable"
+        if sanitize_channel(channel) is None:
+            return web.json_response(
+                {"error": "invalid channel"},
+                status=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        try:
+            manifest = await asyncio.to_thread(read_manifest, updates_root(), channel)
+        except UpdateManifestError:
+            log.warning("app update manifest unreadable channel=%s", channel)
+            return web.json_response(
+                {"error": "update manifest is unreadable"},
+                status=500,
+                headers={"Cache-Control": "no-store"},
+            )
+        if manifest is None:
+            return web.json_response(
+                {"error": "no update published"},
+                status=404,
+                headers={"Cache-Control": "no-store"},
+            )
+        return web.json_response(manifest, headers={"Cache-Control": "no-store"})
+
+    async def handle_app_update_apk(self, request: web.Request) -> web.Response:
+        """The APK named by update.json. The token is the same check as the rest of the hub."""
+        channel = request.rel_url.query.get("channel") or "stable"
+        filename = request.match_info.get("filename") or ""
+        if sanitize_channel(channel) is None:
+            return web.json_response(
+                {"error": "invalid channel"},
+                status=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        status, path = await asyncio.to_thread(
+            resolve_update_apk, updates_root(), channel, filename
+        )
+        if status == "bad_manifest":
+            return web.json_response(
+                {"error": "update manifest is unreadable"},
+                status=500,
+                headers={"Cache-Control": "no-store"},
+            )
+        if status == "checksum":
+            log.warning("app update checksum mismatch channel=%s file=%s", channel, filename)
+            return web.json_response(
+                {"error": "checksum mismatch"},
+                status=409,
+                headers={"Cache-Control": "no-store"},
+            )
+        if path is None:
+            return web.json_response(
+                {"error": "not found"},
+                status=404,
+                headers={"Cache-Control": "no-store"},
+            )
+        response = web.FileResponse(path)
+        response.content_type = "application/vnd.android.package-archive"
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Content-Disposition"] = content_disposition_attachment(path.name)
+        return response
+
+    async def handle_build_index(self, request: web.Request) -> web.Response:
+        """All sessions and worktrees, newest first, with stored summaries."""
+        raw_limit = request.rel_url.query.get("limit") or ""
+        try:
+            limit = int(raw_limit) if raw_limit else DEFAULT_INDEX_LIMIT
+        except ValueError:
+            limit = DEFAULT_INDEX_LIMIT
+        limit = max(1, min(limit, DEFAULT_INDEX_LIMIT))
+        catalog = await asyncio.to_thread(
+            build_catalog,
+            self.config.sessions_root,
+            self._grok_home(),
+            self.summary_store,
+            limit=limit,
+            archive=self.archive_store,
+        )
+        due = catalog.get("due") or []
+        items = catalog.get("items") or []
+        return web.json_response(
+            {
+                "items": items,
+                "count": catalog.get("count", len(items)),
+                "summaryPending": len(due) if isinstance(due, list) else 0,
+            }
+        )
+
+    async def handle_build_summaries_refresh(self, request: web.Request) -> web.Response:
+        """Schedule summary refresh. The list keeps serving the stored text."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        kind = str(body.get("kind") or "").strip()
+        item_id = str(body.get("id") or "").strip()
+        if item_id:
+            self._summary_force.add(item_key(kind or "session", item_id))
+            if kind == "":
+                self._summary_force.add(item_key("worktree", item_id))
+        else:
+            self._summary_force.add("*")
+        return web.json_response({"ok": True, "scheduled": True})
+
+    async def handle_build_resume(self, request: web.Request) -> web.Response:
+        """One shot resume or restart, then the client opens chatPath."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid json"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "invalid json"}, status=400)
+        kind = str(body.get("kind") or "").strip()
+        item_id = str(body.get("id") or "").strip()
+        mode = str(body.get("mode") or "auto").strip()
+        if not item_id:
+            return web.json_response({"error": "id required"}, status=400)
+        item = await asyncio.to_thread(
+            find_catalog_item,
+            self.config.sessions_root,
+            self._grok_home(),
+            kind=kind,
+            item_id=item_id,
+        )
+        if not item:
+            return web.json_response({"error": "session or worktree not found"}, status=404)
+        try:
+            payload = await execute_build_action(self, item, mode=mode)
+        except BuildActionError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception as exc:
+            log.exception("build resume failed")
+            return web.json_response({"error": str(exc)}, status=500)
+        return web.json_response(payload)
+
+    async def _read_object(self, request: web.Request) -> tuple[dict[str, Any] | None, web.Response | None]:
+        try:
+            body = await request.json()
+        except Exception:
+            return None, web.json_response({"error": "invalid json"}, status=400)
+        if not isinstance(body, dict):
+            return None, web.json_response({"error": "invalid json"}, status=400)
+        return body, None
+
+    async def _catalog_item(
+        self, kind: str, item_id: str
+    ) -> tuple[dict[str, Any] | None, web.Response | None]:
+        if not item_id:
+            return None, web.json_response({"error": "id required"}, status=400)
+        item = await asyncio.to_thread(
+            find_catalog_item,
+            self.config.sessions_root,
+            self._grok_home(),
+            kind=kind,
+            item_id=item_id,
+        )
+        if not item:
+            return None, web.json_response({"error": "session or worktree not found"}, status=404)
+        return item, None
+
+    async def handle_build_archive(self, request: web.Request) -> web.Response:
+        """Hide a session or worktree from the main lists. Does not touch session files."""
+        body, err = await self._read_object(request)
+        if err is not None or body is None:
+            return err or web.json_response({"error": "invalid json"}, status=400)
+        kind = str(body.get("kind") or "").strip().lower()
+        item_id = str(body.get("id") or "").strip()
+        if kind not in {"session", "worktree"}:
+            return web.json_response({"error": "kind must be session or worktree"}, status=400)
+        item, missing = await self._catalog_item(kind, item_id)
+        if missing is not None or item is None:
+            return missing or web.json_response({"error": "session or worktree not found"}, status=404)
+        try:
+            payload = archive_catalog_item(self.archive_store, item)
+        except ArchiveError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        return web.json_response(payload)
+
+    async def handle_build_restore(self, request: web.Request) -> web.Response:
+        """Put an archived session or worktree back on the main lists."""
+        body, err = await self._read_object(request)
+        if err is not None or body is None:
+            return err or web.json_response({"error": "invalid json"}, status=400)
+        kind = str(body.get("kind") or "").strip().lower()
+        item_id = str(body.get("id") or "").strip()
+        if kind not in {"session", "worktree"}:
+            return web.json_response({"error": "kind must be session or worktree"}, status=400)
+        item, missing = await self._catalog_item(kind, item_id)
+        if missing is not None or item is None:
+            return missing or web.json_response({"error": "session or worktree not found"}, status=404)
+        try:
+            payload = restore_catalog_item(self.archive_store, item)
+        except ArchiveError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        return web.json_response(payload)
+
+    async def handle_build_worktree_remove(self, request: web.Request) -> web.Response:
+        """git worktree remove from the parent repo. No --force unless force is true."""
+        body, err = await self._read_object(request)
+        if err is not None or body is None:
+            return err or web.json_response({"error": "invalid json"}, status=400)
+        item_id = str(body.get("id") or "").strip()
+        try:
+            force = parse_force(body.get("force", False))
+        except WorktreeRemoveError as exc:
+            return web.json_response({"error": exc.message, "code": exc.code}, status=exc.status)
+        item, missing = await self._catalog_item("worktree", item_id)
+        if missing is not None or item is None:
+            return missing or web.json_response({"error": "session or worktree not found"}, status=404)
+        try:
+            payload = await asyncio.to_thread(
+                remove_catalog_worktree,
+                item,
+                self._grok_home(),
+                self.archive_store,
+                force=force,
+            )
+        except WorktreeRemoveError as exc:
+            return web.json_response(
+                {"error": exc.message, "code": exc.code},
+                status=exc.status,
+            )
+        return web.json_response(payload)
+
+    async def _summary_refresh_loop(self) -> None:
+        """Refresh one stale summary at a time so the hub stays responsive."""
+        await asyncio.sleep(3.0)
+        try:
+            while True:
+                try:
+                    await self._refresh_one_summary()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.debug("summary refresh failed", exc_info=True)
+                await asyncio.sleep(8.0)
+        except asyncio.CancelledError:
+            return
+
+    async def _refresh_one_summary(self) -> None:
+        force_all = "*" in self._summary_force
+        self._summary_force.discard("*")
+        explicit_key = ""
+        if self._summary_force:
+            explicit_key = next(iter(self._summary_force))
+            self._summary_force.discard(explicit_key)
+        catalog = await asyncio.to_thread(
+            build_catalog,
+            self.config.sessions_root,
+            self._grok_home(),
+            self.summary_store,
+            limit=DEFAULT_INDEX_LIMIT,
+        )
+        due = [key for key in (catalog.get("due") or []) if isinstance(key, str)]
+        target = explicit_key or (due[0] if due else "")
+        if not target:
+            return
+        kind, _, item_id = target.partition(":")
+        if not item_id:
+            return
+        item = await asyncio.to_thread(
+            find_catalog_item,
+            self.config.sessions_root,
+            self._grok_home(),
+            kind=kind,
+            item_id=item_id,
+        )
+        if not item:
+            return
+        await asyncio.to_thread(
+            refresh_item_summary,
+            item,
+            self.summary_store,
+            grok_exe=self.config.grok_bin,
+            sessions_root=self.config.sessions_root,
+            scratch_root=PROJECT_ROOT,
+            force=bool(explicit_key) or force_all,
+        )
 
     async def handle_rename_session(self, request: web.Request) -> web.Response:
         session_id = request.match_info["id"]
@@ -2437,9 +3258,12 @@ class Hub:
 
     async def handle_history(self, request: web.Request) -> web.Response:
         session_id = request.match_info["id"]
-        session = find_session(self.config.sessions_root, session_id)
+        session = await asyncio.to_thread(
+            find_session, self.config.sessions_root, session_id
+        )
         path = session.path if session else None
-        messages = load_session_history(
+        messages = await asyncio.to_thread(
+            load_session_history,
             self.config.sessions_root,
             session_id,
             session_path=path,
@@ -2921,6 +3745,7 @@ class Hub:
             )
         try:
             await self.acp.session_load(session_id, cwd)
+            self._dangling_checked.discard(str(session_id or "").strip())
             self._record_hub_session(session_id, cwd)
             self._stamp_origin_sync(session_id, "attach")
             asyncio.create_task(self._stamp_origin_with_retry(session_id, "attach"))
@@ -3054,7 +3879,7 @@ class Hub:
         except Exception:
             pass
         await ws.send_str(json.dumps(self.status_payload()))
-        items = self._scan_sessions()
+        await asyncio.to_thread(self._scan_sessions)
         await ws.send_str(json.dumps({"type": "sessions", "items": self._sessions_items_with_status()}))
         # Push cached agent slash commands so reconnect/new clients get real list
         # without waiting for attach or a later available_commands_update.
@@ -3160,7 +3985,49 @@ class Hub:
         if typ == "user_question_answer":
             await self._ws_user_question_answer(ws, payload)
             return
+        if typ == "restart_session":
+            task = asyncio.create_task(
+                self._ws_restart_session_safe(ws, payload),
+                name="hub-restart-session",
+            )
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
+            return
         await self._emit_error(f"unknown type: {typ}", ws=ws)
+
+    async def _ws_restart_session_safe(
+        self, ws: web.WebSocketResponse, payload: dict[str, Any]
+    ) -> None:
+        try:
+            await self._ws_restart_session(ws, payload)
+        except Exception:
+            log.exception("background restart-session task failed")
+            try:
+                sid = str(payload.get("sessionId") or "")
+                await self._emit_error(
+                    "Could not restart this session.",
+                    session_id=sid or None,
+                    ws=ws,
+                    level="error",
+                )
+            except Exception:
+                pass
+
+    async def _ws_restart_session(
+        self, ws: web.WebSocketResponse, payload: dict[str, Any]
+    ) -> None:
+        sid = str(payload.get("sessionId") or "").strip()
+        cwd = str(payload.get("cwd") or "")
+        if not sid:
+            await self._emit_error("sessionId required", ws=ws)
+            return
+        result = await self._restart_wedged_session(sid, cwd)
+        try:
+            await ws.send_str(
+                json.dumps({"type": "restart_session", "sessionId": sid, **result})
+            )
+        except Exception:
+            log.debug("restart_session reply failed", exc_info=True)
 
     async def _ws_prompt_safe(self, ws: web.WebSocketResponse, payload: dict[str, Any]) -> None:
         try:
@@ -3188,6 +4055,61 @@ class Hub:
         except Exception:
             log.exception("background cancel task failed")
 
+    def _plan_needs_answer(self, session_id: str) -> bool:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return False
+        try:
+            payload = read_session_plan(self.config.sessions_root, sid, None)
+        except Exception:
+            return False
+        return bool(payload.get("awaitingApproval"))
+
+    def _publish_notify(self, session_id: str, kind: str, reason: str) -> None:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        title = "Grok session"
+        cwd = ""
+        try:
+            session = find_session(self.config.sessions_root, sid)
+            if session is not None:
+                raw = str(session.title or "").strip()
+                if raw:
+                    title = raw[:120]
+                cwd = str(session.cwd or "")
+        except Exception:
+            log.debug("notify title lookup failed", exc_info=True)
+        try:
+            path = chat_path(sid, cwd)
+        except Exception:
+            path = f"/?open={sid}&embed=chat"
+        try:
+            self.notify_feed.publish(
+                session_id=sid,
+                kind=kind,
+                reason=reason,
+                title=title,
+                chat_path=path,
+            )
+        except Exception:
+            log.debug("notify publish failed", exc_info=True)
+
+    def _record_turn_notify(self, session_id: str, state: str, error: str | None) -> None:
+        plan_waiting = False
+        if state == "idle" and session_id and not (error or "").strip():
+            plan_waiting = self._plan_needs_answer(session_id)
+        decision = classify_turn_notify(
+            state,
+            error,
+            plan_waiting=plan_waiting,
+            blip_text=ACP_BLIP_USER_MSG,
+        )
+        if decision is None:
+            return
+        kind, reason = decision
+        self._publish_notify(session_id, kind, reason)
+
     def _is_no_output_error(self, exc: BaseException) -> bool:
         return is_no_output_error_message(exc)
 
@@ -3205,8 +4127,12 @@ class Hub:
         state: str,
         error: str | None = None,
         also_session_id: str | None = None,
+        recovery: str | None = None,
+        quiet_notify: bool = False,
     ) -> None:
         """Broadcast turn state; optionally also to a view session id (unlock UI)."""
+        if not quiet_notify:
+            self._record_turn_notify(session_id, state, error)
         if error:
             log.warning(
                 "turn_error session=%s state=%s: %s",
@@ -3220,14 +4146,12 @@ class Hub:
             "state": state,
             "error": error,
         }
+        if recovery:
+            payload["recovery"] = recovery
         await self.broadcast(payload, session_id=session_id)
         if also_session_id and also_session_id != session_id:
-            also = {
-                "type": "turn",
-                "sessionId": also_session_id,
-                "state": state,
-                "error": error,
-            }
+            also = dict(payload)
+            also["sessionId"] = also_session_id
             await self.broadcast(also, session_id=also_session_id)
         # Immediate status so client liveTurns/sessionFlags/pills update on start/end.
         try:
@@ -3556,6 +4480,7 @@ class Hub:
             )
 
         retry_thr = max(NO_OUTPUT_RETRY_SECONDS, no_output_seconds_for_session())
+        await self._cancel_dangling_before_prompt(session_id, view_session_id, cwd)
         try:
             await self.acp.session_prompt(
                 session_id,
@@ -3565,6 +4490,7 @@ class Hub:
                 cwd_key=cwd_key,
                 no_output_seconds=retry_thr,
             )
+            self._clear_wedged(session_id)
             log.info("no-output: auto-retry ok session=%s", session_id)
             try:
                 self.ops.inc("prompt_ok")
@@ -3609,7 +4535,10 @@ class Hub:
                     "(pending hard gate) session=%s agentProcess=up",
                     session_id,
                 )
-            if self._is_no_output_error(retry_exc):
+            wedged_msg, recovery = self._wedged_failure_payload(session_id)
+            if wedged_msg:
+                err_msg = wedged_msg
+            elif self._is_no_output_error(retry_exc):
                 err_msg = NO_OUTPUT_RETRY_FAILED_MSG
             elif self._is_mid_turn_stall_error(retry_exc):
                 err_msg = MID_TURN_STALL_USER_MSG
@@ -3624,11 +4553,16 @@ class Hub:
                     self.acp.last_force_clear_reason
                 )
             await self._broadcast_turn(
-                session_id, "idle", err_msg, also_session_id=view_session_id
+                session_id,
+                "idle",
+                err_msg,
+                also_session_id=view_session_id,
+                recovery=recovery,
             )
-            await self._emit_error(
-                err_msg, session_id=session_id, level="warning"
-            )
+            if not recovery:
+                await self._emit_error(
+                    err_msg, session_id=session_id, level="warning"
+                )
             return False
 
     async def _execute_compact(
@@ -3973,6 +4907,8 @@ class Hub:
 
         # ensure path session/new'd if needed; multi-session agent holds id without load.
         thr = no_output_seconds_for_session()
+        # Orphaned tool from a dropped turn: cancel before this prompt, not after.
+        await self._cancel_dangling_before_prompt(session_id, view_session_id, cwd)
         try:
             await self.acp.session_prompt(
                 session_id,
@@ -3982,6 +4918,7 @@ class Hub:
                 cwd_key=cwd_key,
                 no_output_seconds=thr,
             )
+            self._clear_wedged(session_id)
             log.info("WS prompt end session=%s ok", session_id)
             try:
                 self.ops.inc("prompt_ok")
@@ -4004,13 +4941,33 @@ class Hub:
                 )
             except Exception:
                 pass
-            if self.acp.is_session_active(session_id):
+            keepalive_blip = (
+                is_keepalive_ping_timeout(exc)
+                or ACP_BLIP_USER_MSG in str(exc)
+                or session_id in self.acp.blip_hold_session_ids
+            )
+            # Do not cancel the agent: a busy turn may still be running.
+            if self.acp.is_session_active(session_id) and not keepalive_blip:
                 await self.acp.end_turn(
                     session_id, f"prompt exception: {exc}"
                 )
 
+            # A dangling tool that stayed silent is not retried. Restart the
+            # agent when nobody else is in a turn, then load the same session.
+            if (
+                not keepalive_blip
+                and session_id in self._wedged_sessions
+                and self._is_no_output_error(exc)
+            ):
+                await self._recover_wedged_silence(
+                    session_id, view_session_id, cwd
+                )
             # Hang with zero output: heal + auto-retry once on same session.
-            if should_auto_retry_no_output(exc, already_retried=not _auto_retry):
+            elif (
+                not keepalive_blip
+                and session_id not in self._wedged_sessions
+                and should_auto_retry_no_output(exc, already_retried=not _auto_retry)
+            ):
                 await self._no_output_auto_retry(
                     session_id=session_id,
                     view_session_id=view_session_id,
@@ -4020,7 +4977,13 @@ class Hub:
                 )
             else:
                 err_msg = str(exc)
-                if self._is_no_output_error(exc):
+                wedged_msg, recovery = self._wedged_failure_payload(session_id)
+                if keepalive_blip:
+                    err_msg = ACP_BLIP_USER_MSG
+                    recovery = None
+                elif wedged_msg:
+                    err_msg = wedged_msg
+                elif self._is_no_output_error(exc):
                     try:
                         self.ops.inc("prompt_no_output")
                         self.ops.emit(
@@ -4056,15 +5019,33 @@ class Hub:
                         self.acp.last_force_clear_reason
                     )
 
-                await self._broadcast_turn(
-                    session_id, "idle", err_msg, also_session_id=view_session_id
-                )
-                await self._emit_error(
-                    err_msg, session_id=session_id, level="warning"
-                )
+                still_active = self.acp.is_session_active(session_id)
+                if keepalive_blip and still_active:
+                    await self._broadcast_turn(
+                        session_id,
+                        "running",
+                        err_msg,
+                        also_session_id=view_session_id,
+                    )
+                else:
+                    await self._broadcast_turn(
+                        session_id,
+                        "idle",
+                        err_msg,
+                        also_session_id=view_session_id,
+                        recovery=recovery,
+                    )
+                    if not keepalive_blip and not recovery:
+                        await self._emit_error(
+                            err_msg, session_id=session_id, level="warning"
+                        )
         finally:
-            # Always re-assert idle unlock path via status (success already idled above)
-            if self.acp.is_session_active(session_id):
+            # Always re-assert idle unlock path via status (success already idled above).
+            # A keepalive hold means the agent may still be working: do not cancel it.
+            if (
+                self.acp.is_session_active(session_id)
+                and session_id not in self.acp.blip_hold_session_ids
+            ):
                 await self.acp.end_turn(
                     session_id, "prompt finally safeguard"
                 )

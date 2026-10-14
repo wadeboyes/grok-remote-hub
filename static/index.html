@@ -9,13 +9,149 @@
   <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
   <link rel="apple-touch-icon" href="/favicon.svg" />
   <title>Grok Remote Hub</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/app.css?v=20260726a" />
+  <script>
+    (function () {
+      try {
+        var q = new URLSearchParams(location.search);
+        if (q.get("embed") === "chat") document.documentElement.classList.add("embed-chat");
+      } catch (e) {}
+    })();
+  </script>
+  <!-- Critical first paint: never flash raw HTML if app.css is delayed
+       (Tailscale-only path or Brave Shields). No third-party webfonts. -->
+  <style>
+    @font-face {
+      font-family: Inter;
+      font-style: normal;
+      font-weight: 400;
+      font-display: swap;
+      src: url("/fonts/inter-latin-400.woff2") format("woff2");
+    }
+    @font-face {
+      font-family: Inter;
+      font-style: normal;
+      font-weight: 500 700;
+      font-display: swap;
+      src: url("/fonts/inter-latin-600.woff2") format("woff2");
+    }
+    :root {
+      --bg: #0a0c10;
+      --surface: #121722;
+      --surface-2: #181f2a;
+      --border: #2a3548;
+      --text: #e8edf5;
+      --muted: #8b97a8;
+      --accent: #e6b84d;
+    }
+    html, body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    .hidden, [hidden] { display: none !important; }
+    button {
+      font: inherit;
+      color: inherit;
+      cursor: pointer;
+      -webkit-appearance: none;
+      appearance: none;
+      border: 1px solid var(--border);
+      background: var(--surface-2);
+      border-radius: 10px;
+      min-height: 44px;
+      padding: 10px 14px;
+    }
+    .btn-accent { background: var(--accent); border-color: var(--accent); color: #1a1200; font-weight: 600; }
+    .btn-ghost { background: transparent; }
+    .btn-icon { width: 44px; min-width: 44px; padding: 0; }
+    input, textarea {
+      font: inherit;
+      color: inherit;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+    #app { display: flex; min-height: 100dvh; background: var(--bg); }
+    .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+    @media (max-width: 899px) {
+      #rail {
+        position: fixed;
+        top: 0; left: 0; bottom: 0;
+        width: min(88%, 340px);
+        transform: translateX(-105%);
+        z-index: 40;
+        background: var(--surface);
+      }
+      #rail.open { transform: translateX(0); }
+      #app.is-home .composer-shell,
+      #app.is-home .turn-strip { display: none !important; }
+    }
+    /* Embedded chat: keep a real column. 100dvh of 0 in a WebView clips to black. */
+    html.embed-chat,
+    html.embed-chat body {
+      height: 100%;
+      background: #0a0c10;
+      color: #e8edf5;
+    }
+    html.embed-chat #app {
+      display: flex !important;
+      height: 100% !important;
+      min-height: 100% !important;
+      max-height: none !important;
+    }
+    html.embed-chat .main,
+    html.embed-chat .chat-panel {
+      display: flex !important;
+      flex-direction: column;
+      flex: 1 1 auto;
+      height: 100%;
+      min-height: 0;
+      width: 100%;
+    }
+    html.embed-chat #rail,
+    html.embed-chat #rail-backdrop,
+    html.embed-chat #btn-menu,
+    html.embed-chat #btn-rail-collapse,
+    html.embed-chat #btn-topbar-new,
+    html.embed-chat #empty-main {
+      display: none !important;
+    }
+    html.embed-chat .composer-shell,
+    html.embed-chat #app.is-home .composer-shell {
+      display: flex !important;
+      flex-direction: column !important;
+      align-items: stretch;
+      width: 100% !important;
+      max-width: 100%;
+      flex-shrink: 0;
+      box-sizing: border-box;
+    }
+    html.embed-chat #app.is-home .turn-strip {
+      display: flex !important;
+      flex-shrink: 0;
+    }
+    html.embed-chat .composer,
+    html.embed-chat #composer-form {
+      display: flex !important;
+      flex-direction: row !important;
+      align-items: flex-end;
+      width: 100% !important;
+      min-width: 0;
+    }
+    html.embed-chat #composer-input {
+      display: block !important;
+      flex: 1 1 auto;
+      width: auto;
+      min-width: 0;
+      min-height: 44px;
+      max-height: 8.5em;
+    }
+  </style>
+  <link rel="stylesheet" href="/app.css?v=20261014g" />
 </head>
-<body style="background:#0a0c10;color:#d6deea">
-  <div id="app">
+<body style="background:#0a0c10;color:#e8edf5;font-family:Inter,system-ui,-apple-system,'Segoe UI',Roboto,sans-serif">
+  <div id="app" class="is-home">
     <aside id="rail" class="rail" aria-label="Sidebar">
       <div class="rail-header">
         <div class="brand">
@@ -68,7 +204,7 @@
         <button type="button" id="btn-menu" class="btn btn-ghost btn-icon" aria-label="Open sidebar" title="Browse sessions">☰</button>
         <div class="topbar-meta">
           <div class="topbar-title-row">
-            <h1 id="chat-title" class="chat-title">Select a session</h1>
+            <h1 id="chat-title" class="chat-title">Grok Hub</h1>
             <button type="button" id="btn-rename-session" class="session-rename-btn topbar-rename hidden" aria-label="Rename session" title="Rename session">✎</button>
           </div>
           <div class="chat-sub" id="chat-sub">
@@ -78,6 +214,7 @@
             <button type="button" id="chat-session-id" class="chip chip-session-id meta-chip hidden" title="Click to copy full session id" aria-label="Copy session id"></button>
           </div>
         </div>
+        <button type="button" id="btn-topbar-new" class="btn btn-accent btn-sm">New</button>
         <div id="status-pill" class="status-pill" data-state="connecting" title="Connection status">
           <span class="status-dot" aria-hidden="true"></span>
           <span id="status-label">Connecting</span>
@@ -142,12 +279,20 @@
           <div id="transcript" class="transcript" aria-live="polite">
             <div id="empty-main" class="empty-main">
               <div class="empty-card">
-                <h2>No session selected</h2>
-                <p class="empty-sub">Pick a chat from the sidebar, or start a new one.</p>
-                <p>Your project sessions appear under Working. Subagent runs are under Subagent.</p>
+                <div class="empty-hero">
+                  <span class="empty-mark" aria-hidden="true"></span>
+                  <h2>No session selected</h2>
+                  <p class="empty-sub">Pick a chat from the sidebar, or start a new one.</p>
+                  <p class="empty-lead">Your project sessions appear under Working. Subagent runs are under Subagent.</p>
+                </div>
+                <div id="home-sessions-wrap" class="home-sessions-wrap">
+                  <h3 class="home-sessions-heading" id="home-sessions-heading">Working</h3>
+                  <div id="home-sessions" class="home-sessions" role="list" aria-labelledby="home-sessions-heading"></div>
+                  <p id="home-sessions-empty" class="home-sessions-empty muted">No working sessions yet. Start one below.</p>
+                </div>
                 <div class="empty-actions">
-                  <button type="button" id="btn-empty-sessions" class="btn btn-ghost">Browse sessions</button>
-                  <button type="button" id="btn-empty-new" class="btn btn-accent">New session</button>
+                  <button type="button" id="btn-empty-new" class="btn btn-accent btn-block">New session</button>
+                  <button type="button" id="btn-empty-sessions" class="btn btn-ghost btn-block">Browse sessions</button>
                 </div>
               </div>
             </div>
@@ -158,9 +303,12 @@
         </div>
 
         <div class="composer-shell">
-          <div id="turn-strip" class="turn-strip" data-state="idle" aria-live="polite">
-            <span id="turn-strip-text">idle</span>
-            <span id="turn-strip-cursor" class="term-cursor hidden" aria-hidden="true">▋</span>
+          <div class="composer-meta">
+            <div id="turn-strip" class="turn-strip" data-state="idle" aria-live="polite">
+              <span id="turn-strip-text">idle</span>
+              <span id="turn-strip-cursor" class="term-cursor hidden" aria-hidden="true">▋</span>
+            </div>
+            <p id="composer-hint" class="composer-hint muted">Remote agent stream. Load a session to chat; desktop TUI stays separate.</p>
           </div>
           <div id="slash-palette" class="slash-palette hidden" role="listbox" aria-label="Slash commands"></div>
           <form id="composer-form" class="composer">
@@ -190,7 +338,6 @@
               <button type="submit" id="btn-send" class="btn btn-accent" disabled>Send</button>
             </div>
           </form>
-          <p id="composer-hint" class="composer-hint muted">Remote agent stream. Load a session to chat; desktop TUI stays separate.</p>
         </div>
       </div>
 
@@ -227,6 +374,7 @@
   <div id="modal-new" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="modal-new-title">
     <div class="modal-backdrop" data-close="modal-new"></div>
     <div class="modal-card">
+      <div class="sheet-handle" aria-hidden="true"></div>
       <header class="modal-header">
         <h2 id="modal-new-title">New session</h2>
         <button type="button" class="btn btn-ghost btn-icon" data-close="modal-new" aria-label="Close">×</button>
@@ -238,10 +386,13 @@
       </div>
       <div id="project-list-view" class="project-list-view">
         <input type="search" id="project-search" class="input" placeholder="Filter projects" autocomplete="off" />
-        <div class="project-create project-create-secondary">
-          <input type="text" id="project-new-name" class="input" placeholder="New folder name" autocomplete="off" />
-          <button type="button" id="btn-create-project" class="btn btn-sm btn-ghost">Create</button>
-        </div>
+        <details class="project-create-details">
+          <summary class="project-create-summary">Create folder</summary>
+          <div class="project-create project-create-secondary">
+            <input type="text" id="project-new-name" class="input" placeholder="New folder name" autocomplete="off" />
+            <button type="button" id="btn-create-project" class="btn btn-ghost">Create</button>
+          </div>
+        </details>
         <div id="project-recents" class="project-recents hidden">
           <div class="project-section-label">Recent</div>
           <div id="project-recents-list" class="project-list project-recents-list" role="list"></div>
@@ -265,9 +416,9 @@
         <p class="muted modal-help" id="project-entry-choice-help">Continue a previous session or start fresh in this folder.</p>
         <p class="project-entry-cwd muted" id="project-entry-cwd"></p>
         <div id="project-entry-priors" class="project-entry-priors" role="list"></div>
-        <div class="project-browser-actions">
-          <button type="button" id="btn-entry-start-new" class="btn btn-sm btn-accent">Start new session</button>
-          <button type="button" id="btn-entry-back" class="btn btn-sm btn-ghost">Back</button>
+        <div class="project-browser-actions project-entry-actions">
+          <button type="button" id="btn-entry-start-new" class="btn btn-accent btn-block">Start new session</button>
+          <button type="button" id="btn-entry-back" class="btn btn-ghost btn-block">Back</button>
         </div>
       </div>
     </div>
@@ -276,6 +427,7 @@
   <div id="modal-ask-user" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="modal-ask-user-title">
     <div class="modal-backdrop" data-close="modal-ask-user"></div>
     <div class="modal-card modal-card-ask">
+      <div class="sheet-handle" aria-hidden="true"></div>
       <header class="modal-header">
         <h2 id="modal-ask-user-title">Agent question</h2>
         <button type="button" class="btn btn-ghost btn-icon" data-close="modal-ask-user" aria-label="Close">×</button>
@@ -326,6 +478,7 @@
   <div id="modal-plan" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="modal-plan-title">
     <div class="modal-backdrop" data-close="modal-plan"></div>
     <div class="modal-card modal-card-plan">
+      <div class="sheet-handle" aria-hidden="true"></div>
       <header class="modal-header">
         <div class="plan-title-wrap">
           <h2 id="modal-plan-title">Session plan</h2>
@@ -356,7 +509,7 @@
 
   <script src="/vendor/marked.min.js"></script>
   <script src="/vendor/purify.min.js"></script>
-  <!-- cache-bust: blank-page fix; mermaid loads on demand from app.js when needed -->
-  <script src="/app.js?v=20260726a"></script>
+  <!-- cache-bust: resume chat opens the deep-linked session; mermaid loads on demand -->
+  <script src="/app.js?v=20261014g"></script>
 </body>
 </html>

@@ -25,6 +25,7 @@ def test_css_terminal_tokens() -> None:
     assert "--assistant: #6dca8d" in css
     assert "--accent: #e6b84d" in css
     assert "IBM Plex Mono" in css
+    assert "system-ui" in css
     assert ".term-line" in css
     assert ".term-prefix" in css
     assert ".turn-strip" in css
@@ -55,7 +56,9 @@ def test_html_turn_strip_and_empty_state() -> None:
     assert "No session selected" in html
     assert "Pick a chat from the sidebar" in html
     assert "Message… (/ for commands)" in html or "Message" in html
-    assert "IBM+Plex+Mono" in html or "IBM Plex Mono" in html
+    assert "system-ui" in html
+    assert "fonts.googleapis.com/css" not in html
+    assert "fonts.gstatic.com" not in html
     assert "composer-prompt" in html
     assert "&gt;" in html or ">" in html
 

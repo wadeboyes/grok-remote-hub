@@ -13,7 +13,7 @@ If someone can open your hub URL without a token, they can drive that agent.
 ## Hardening checklist (recommended)
 
 1. **Do not bind `0.0.0.0`.** Defaults dual-bind localhost + Tailscale IPv4 only.
-2. Set **`hub_token`** in `config.toml` and open the UI with `?token=…` or `Authorization: Bearer …`.
+2. Set **`hub_token`** in `config.toml` and open the UI with `?token=…` or `Authorization: Bearer …`. A successful check also sets a `hub_token` cookie so stylesheets and scripts can load. That cookie is the same secret, not a bypass. `/health` is still the only route that skips the check.
 3. Keep the agent on **`127.0.0.1`** (default). The agent secret file `data/agent.secret` is gitignored.
 4. Run the hub only on a machine you trust; treat Tailscale membership like physical access.
 5. Never commit `config.toml`, `data/`, `logs/`, or `~/.grok/auth.json`.

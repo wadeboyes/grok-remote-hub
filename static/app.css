@@ -1,3 +1,19 @@
+@font-face {
+  font-family: Inter;
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/fonts/inter-latin-400.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: Inter;
+  font-style: normal;
+  font-weight: 500 700;
+  font-display: swap;
+  src: url("/fonts/inter-latin-600.woff2") format("woff2");
+}
+
 :root {
   --bg: #0a0c10;
   --surface: #0f1318;
@@ -15,9 +31,10 @@
   --rail-w: 300px;
   --topbar-h: 52px;
   --composer-min: 72px;
-  --radius: 6px;
-  --font: "IBM Plex Mono", ui-monospace, "Cascadia Code", Consolas, monospace;
-  --font-ui: "IBM Plex Sans", system-ui, sans-serif;
+  --radius: 10px;
+  --radius-lg: 16px;
+  --font: ui-monospace, "SFMono-Regular", "Cascadia Code", "IBM Plex Mono", "Roboto Mono", Menlo, Consolas, monospace;
+  --font-ui: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
   --safe-b: env(safe-area-inset-bottom, 0px);
   --safe-t: env(safe-area-inset-top, 0px);
   --vv-offset: 0px;
@@ -39,8 +56,8 @@ body {
   overflow-x: hidden;
   background: var(--bg);
   color: var(--text);
-  font-family: var(--font);
-  font-size: 13.5px;
+  font-family: var(--font-ui);
+  font-size: 14px;
   line-height: 1.5;
   -webkit-text-size-adjust: 100%;
 }
@@ -56,6 +73,8 @@ button {
   cursor: pointer;
   border: none;
   background: none;
+  -webkit-appearance: none;
+  appearance: none;
 }
 
 a {
@@ -295,11 +314,11 @@ a {
   width: 100%;
   background: var(--bg);
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: 8px;
   padding: 7px 9px;
   outline: none;
-  font-family: var(--font);
-  font-size: 12.5px;
+  font-family: var(--font-ui);
+  font-size: 13px;
 }
 
 .input:focus {
@@ -769,8 +788,9 @@ a {
 
 .empty-sub {
   color: var(--accent);
-  font-family: var(--font);
-  font-size: 12px;
+  font-family: var(--font-ui);
+  font-size: 14px;
+  font-weight: 500;
   margin: 0 0 6px;
 }
 
@@ -1553,7 +1573,8 @@ a {
   }
 }
 
-#btn-menu {
+#btn-menu,
+#btn-topbar-new {
   display: none;
 }
 
@@ -1564,9 +1585,10 @@ a {
 
 .chat-title {
   margin: 0;
-  font-size: 13px;
-  font-weight: 500;
-  font-family: var(--font);
+  font-size: 15px;
+  font-weight: 600;
+  font-family: var(--font-ui);
+  letter-spacing: -0.01em;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1987,18 +2009,39 @@ a {
 
 .empty-card {
   max-width: 440px;
-  background: transparent;
-  border: 1px dashed var(--border);
-  border-radius: 4px;
-  padding: 20px;
-  font-family: var(--font);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 24px 22px 20px;
+  font-family: var(--font-ui);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.28);
+}
+
+.empty-hero {
+  margin-bottom: 8px;
+}
+
+.empty-mark {
+  display: block;
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-dim);
+  margin-bottom: 14px;
 }
 
 .empty-card h2 {
   margin: 0 0 8px;
-  font-size: 14px;
-  font-weight: 500;
-  color: var(--accent);
+  font-size: 20px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  color: var(--text);
+  font-family: var(--font-ui);
+}
+
+.empty-lead {
+  color: var(--muted);
 }
 
 .empty-card p {
@@ -2738,15 +2781,49 @@ a {
 /* Composer = shell prompt (must stay clickable during turns / queue) */
 .composer-shell {
   position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  width: 100%;
   border-top: 1px solid var(--border);
   background: var(--surface);
   padding: 8px 12px calc(8px + var(--safe-b));
   z-index: 40;
   min-width: 0;
   max-width: 100%;
-  overflow: visible; /* was overflow-x: hidden — clips slash palette */
+  box-sizing: border-box;
+  overflow: visible; /* was overflow-x: hidden; that clipped the slash palette */
   pointer-events: auto;
   flex-shrink: 0;
+}
+
+.composer-meta {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  margin: 0 0 6px;
+}
+
+.composer-meta .turn-strip {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  padding: 0 2px;
+  border: none;
+  min-height: 18px;
+}
+
+.composer-meta .composer-hint {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .composer-shell .composer,
@@ -2918,14 +2995,16 @@ a {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  border-radius: 4px;
+  border-radius: 8px;
   padding: 6px 12px;
-  font-weight: 500;
-  font-family: var(--font);
-  font-size: 12.5px;
+  font-weight: 550;
+  font-family: var(--font-ui);
+  font-size: 13px;
   border: 1px solid var(--border);
   background: var(--surface-2);
-  transition: background 150ms ease, border-color 150ms ease, opacity 150ms ease;
+  -webkit-appearance: none;
+  appearance: none;
+  transition: background 150ms ease, border-color 150ms ease, opacity 150ms ease, filter 150ms ease;
 }
 
 .btn:disabled {
@@ -3003,11 +3082,15 @@ a {
   flex-direction: column;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: 12px;
   padding: 12px;
   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
   min-width: 0;
-  font-family: var(--font);
+  font-family: var(--font-ui);
+}
+
+.sheet-handle {
+  display: none;
 }
 
 .modal-header {
@@ -3019,8 +3102,10 @@ a {
 
 .modal-header h2 {
   margin: 0;
-  font-size: 14px;
-  font-weight: 500;
+  font-size: 16px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  font-family: var(--font-ui);
 }
 
 .modal-help {
@@ -3408,6 +3493,29 @@ a {
 .project-create-secondary {
   margin-bottom: 8px;
   opacity: 0.92;
+}
+
+.project-create-details {
+  margin: 0 0 10px;
+  flex-shrink: 0;
+}
+
+.project-create-summary {
+  list-style: none;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  padding: 8px 2px;
+  font-family: var(--font-ui);
+}
+
+.project-create-summary::-webkit-details-marker {
+  display: none;
+}
+
+.project-create-details[open] .project-create-summary {
+  color: var(--text);
 }
 
 .project-create .input {
@@ -4174,13 +4282,14 @@ a {
   }
 }
 
-/* Narrow phones: keep row layout (do not stack composer) */
+/* Narrow phones: one full-width row. Attach left, text, Send right. */
 @media (max-width: 480px) {
   .composer {
     flex-direction: row;
-    align-items: flex-start;
-    padding: 8px 10px;
-    gap: 8px;
+    align-items: flex-end;
+    width: 100%;
+    padding: 4px 6px;
+    gap: 6px;
   }
 
   .composer::before {
@@ -4191,15 +4300,16 @@ a {
     flex: 1 1 auto;
     min-width: 0;
     width: auto;
-    min-height: 24px;
+    min-height: 44px;
     font-size: 16px !important;
   }
 
   .composer-actions {
-    justify-content: flex-end;
-    width: auto;
-    flex-shrink: 0;
-    align-self: flex-end;
+    display: contents;
+  }
+
+  .composer-hint {
+    display: none;
   }
 
   .empty-card {
@@ -4209,5 +4319,1004 @@ a {
 
   .empty-main {
     padding: 16px 10px;
+  }
+}
+
+/* Mobile-first touch (phone / tablet portrait)
+   Desktop (≥900px) keeps compact rail + chrome. These overrides only apply
+   under 899px so hub/ACP behavior is unchanged. */
+:root {
+  --touch: 44px;
+  --touch-lg: 48px;
+}
+
+.btn-block {
+  width: 100%;
+  min-height: var(--touch);
+}
+
+.home-sessions-wrap {
+  margin: 16px 0 18px;
+  min-width: 0;
+}
+
+.home-sessions-heading {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-family: var(--font-ui);
+}
+
+.home-sessions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.home-sessions-empty {
+  margin: 0;
+  font-size: 12.5px;
+}
+
+.home-session-row {
+  display: grid;
+  grid-template-columns: 3px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  width: 100%;
+  min-height: var(--touch-lg);
+  text-align: left;
+  padding: 12px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+.home-session-row:hover,
+.home-session-row:focus-visible {
+  border-color: var(--accent-dim);
+  outline: none;
+  box-shadow: var(--focus);
+}
+
+.home-session-row .live-bar {
+  width: 3px;
+  align-self: stretch;
+  border-radius: 1px;
+  background: transparent;
+}
+
+.home-session-row.turn-live .live-bar,
+.home-session-row.status-working .live-bar {
+  background: var(--accent);
+}
+
+.home-session-row.status-question .live-bar {
+  background: var(--accent);
+}
+
+.home-session-row.status-stuck .live-bar {
+  background: var(--danger);
+}
+
+.home-session-body {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.home-session-row .title {
+  font-weight: 500;
+  font-size: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.home-session-row .title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.home-session-row .meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.home-session-cta {
+  flex-shrink: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: #1a1200;
+  background: var(--accent);
+  border-radius: 8px;
+  padding: 10px 14px;
+  min-height: var(--touch);
+  min-width: 72px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+@media (max-width: 899px) {
+  html,
+  body {
+    font-size: 15px;
+  }
+
+  .btn,
+  .btn-sm {
+    min-height: var(--touch);
+    min-width: var(--touch);
+    padding: 10px 14px;
+    font-size: 14px;
+    border-radius: 8px;
+    touch-action: manipulation;
+  }
+
+  .btn-icon {
+    width: var(--touch);
+    height: var(--touch);
+    min-width: var(--touch);
+    min-height: var(--touch);
+    padding: 0;
+    font-size: 20px;
+  }
+
+  .btn-block {
+    width: 100%;
+  }
+
+  .btn-accent {
+    font-weight: 600;
+  }
+
+  .input {
+    min-height: var(--touch);
+    padding: 10px 12px;
+    font-size: 16px;
+    border-radius: 8px;
+  }
+
+  /* Rail: full-width New, 44px tabs / chips / rows */
+  .rail-header {
+    flex-wrap: wrap;
+    padding: 14px 12px 10px;
+    gap: 10px;
+  }
+
+  .rail-header-actions {
+    width: 100%;
+    gap: 8px;
+  }
+
+  #btn-new {
+    flex: 1;
+    min-height: var(--touch-lg);
+    font-weight: 600;
+  }
+
+  #btn-rail-collapse {
+    min-width: var(--touch);
+    min-height: var(--touch);
+  }
+
+  .rail-tabs {
+    gap: 6px;
+    padding: 0 10px 10px;
+  }
+
+  .rail-tab {
+    min-height: var(--touch);
+    padding: 10px 8px;
+    font-size: 14px;
+    border-radius: 8px;
+  }
+
+  .search-wrap {
+    padding: 0 10px 10px;
+  }
+
+  .session-kind-filter {
+    gap: 6px;
+    padding: 0 10px 10px;
+  }
+
+  .kind-chip {
+    min-height: var(--touch);
+    padding: 10px 8px;
+    font-size: 13px;
+    border-radius: 8px;
+    border-color: var(--border);
+  }
+
+  .session-row {
+    min-height: var(--touch-lg);
+    padding: 12px 10px;
+    margin-bottom: 6px;
+    border-radius: 8px;
+    touch-action: manipulation;
+  }
+
+  .session-row .title {
+    font-size: 14px;
+  }
+
+  .session-pin,
+  .session-rename-btn,
+  .session-delete-btn {
+    width: var(--touch);
+    height: var(--touch);
+    min-width: var(--touch);
+    min-height: var(--touch);
+    opacity: 0.85;
+    font-size: 16px;
+  }
+
+  .session-row:hover .session-pin,
+  .session-row:focus-within .session-pin,
+  .session-row.pinned .session-pin,
+  .session-row:hover .session-rename-btn,
+  .session-row:focus-within .session-rename-btn,
+  .session-row.active .session-rename-btn,
+  .session-row.renaming .session-rename-btn,
+  .session-row:hover .session-delete-btn,
+  .session-row:focus-within .session-delete-btn,
+  .session-row.active .session-delete-btn,
+  .session-row.active .session-pin {
+    opacity: 1;
+  }
+
+  .topbar {
+    --topbar-h: 56px;
+    height: var(--topbar-h);
+    min-height: var(--topbar-h);
+    padding: 0 10px;
+    gap: 8px;
+  }
+
+  #btn-menu {
+    width: var(--touch);
+    height: var(--touch);
+    min-width: var(--touch);
+    min-height: var(--touch);
+  }
+
+  .status-pill {
+    width: var(--touch);
+    height: var(--touch);
+    min-width: var(--touch);
+    min-height: var(--touch);
+  }
+
+  .topbar-rename {
+    width: var(--touch);
+    height: var(--touch);
+    opacity: 0.9;
+  }
+
+  .empty-main {
+    display: block;
+    height: auto;
+    min-height: 100%;
+    padding: 16px 12px 24px;
+    place-items: unset;
+  }
+
+  .empty-card {
+    max-width: 100%;
+    padding: 8px 2px 16px;
+    border: none;
+    border-radius: 0;
+    background: transparent;
+  }
+
+  .empty-card h2 {
+    font-size: 18px;
+  }
+
+  .empty-card p {
+    font-size: 14px;
+  }
+
+  .empty-actions {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+    margin-top: 4px;
+  }
+
+  .empty-actions .btn {
+    width: 100%;
+    min-height: var(--touch-lg);
+  }
+
+  /* Composer: full-width row. Attach left, field grows, Send right. */
+  .composer-shell {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    width: 100%;
+    padding: 4px 4px calc(6px + var(--safe-b));
+  }
+
+  .composer {
+    flex-direction: row;
+    align-items: flex-end;
+    width: 100%;
+    min-width: 0;
+    padding: 2px 2px;
+    gap: 4px;
+    border-radius: 10px;
+  }
+
+  .composer-input {
+    order: 2;
+    flex: 1 1 auto;
+    width: auto;
+    min-width: 0;
+    min-height: 44px;
+    max-height: 8.5em;
+    font-size: 16px !important;
+    line-height: 1.4 !important;
+    padding: 8px 0 !important;
+  }
+
+  .composer-actions {
+    display: contents;
+  }
+
+  #btn-attach {
+    order: 1;
+    flex: 0 0 44px;
+    width: 44px;
+    min-width: 44px;
+    max-width: 44px;
+    min-height: 44px;
+    height: 44px;
+    padding: 0;
+  }
+
+  #btn-stop {
+    order: 3;
+    flex: 0 0 auto;
+    width: auto;
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0 10px;
+    white-space: nowrap;
+  }
+
+  #btn-send {
+    order: 4;
+    flex: 0 0 auto;
+    width: auto;
+    min-width: 44px;
+    min-height: 44px;
+    height: 44px;
+    padding: 0 4px;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0;
+    white-space: nowrap;
+    box-sizing: border-box;
+  }
+
+  .jump-latest {
+    min-height: var(--touch);
+    padding: 10px 16px;
+    font-size: 14px;
+    border-radius: 8px;
+  }
+
+  .slash-item {
+    min-height: var(--touch);
+    padding: 12px 12px;
+  }
+
+  /* Banners + error strip */
+  .plan-await-banner,
+  .error-strip,
+  .latency-hint-banner {
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 10px 12px;
+  }
+
+  .plan-inline-btn,
+  .latency-hint-dismiss,
+  .error-strip-actions .btn {
+    min-height: var(--touch);
+    min-width: var(--touch);
+  }
+
+  .error-strip-actions {
+    width: 100%;
+    gap: 8px;
+  }
+
+  .error-strip-actions .btn {
+    flex: 1 1 auto;
+  }
+
+  .error-strip-msg {
+    white-space: normal;
+  }
+
+  /* File chrome */
+  .file-toolbar .btn,
+  .file-toolbar-actions .btn,
+  .file-md-modes .btn,
+  .fs-toolbar .btn {
+    min-height: var(--touch);
+    min-width: var(--touch);
+  }
+
+  .file-toolbar-actions {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  /* Modals: sheet-like, big primary actions */
+  .modal {
+    padding: 0;
+    align-items: end;
+    place-items: end center;
+  }
+
+  .modal-card,
+  .modal-card-ask,
+  .modal-card-plan,
+  .modal-card-site-preview {
+    width: 100%;
+    max-width: 100%;
+    max-height: min(96dvh, 100%);
+    min-height: 0;
+    border-radius: 16px 16px 0 0;
+    padding: 14px 14px calc(14px + var(--safe-b));
+  }
+
+  .modal-card-site-preview {
+    height: min(96dvh, 100%);
+    border-radius: 16px 16px 0 0;
+  }
+
+  .modal-header h2 {
+    font-size: 18px;
+  }
+
+  .modal-header .btn-icon {
+    width: var(--touch);
+    height: var(--touch);
+  }
+
+  .modal-actions,
+  .ask-user-actions,
+  .plan-actions,
+  .project-entry-actions,
+  .project-browser-actions {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+    padding-top: 12px;
+  }
+
+  .modal-actions .btn,
+  .ask-user-actions .btn,
+  .plan-actions .btn,
+  .project-entry-actions .btn,
+  .project-browser-actions .btn,
+  .project-use-btn,
+  #btn-browse-start,
+  #btn-entry-start-new,
+  #btn-entry-back,
+  #btn-ask-user-cancel,
+  #btn-ask-user-submit,
+  #btn-plan-close,
+  #btn-plan-quit,
+  #btn-plan-request-changes,
+  #btn-plan-approve {
+    width: 100%;
+    min-height: var(--touch-lg);
+    justify-content: center;
+  }
+
+  #btn-ask-user-submit,
+  #btn-plan-approve,
+  #btn-entry-start-new,
+  #btn-browse-start {
+    font-weight: 600;
+    order: 3;
+  }
+
+  #btn-ask-user-cancel,
+  #btn-entry-back,
+  #btn-plan-close {
+    order: 1;
+  }
+
+  #btn-plan-quit,
+  #btn-plan-request-changes {
+    order: 2;
+  }
+
+  .project-mode-tab {
+    min-height: var(--touch);
+    font-size: 14px;
+  }
+
+  .project-create {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+
+  .project-create-summary {
+    min-height: var(--touch);
+    display: flex;
+    align-items: center;
+    font-size: 15px;
+  }
+
+  .project-create .btn {
+    width: 100%;
+    min-height: var(--touch);
+  }
+
+  .project-row,
+  .browse-folder-row,
+  .project-browser-list .project-row,
+  .project-entry-row {
+    min-height: var(--touch-lg);
+    padding: 12px 10px;
+    border-radius: 8px;
+  }
+
+  .project-browser-crumb {
+    min-height: var(--touch);
+    padding: 8px 10px;
+  }
+
+  .ask-user-opt {
+    min-height: var(--touch-lg);
+    padding: 14px 12px;
+  }
+
+  .site-preview-toolbar,
+  .site-preview-presets {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .site-preview-preset,
+  #btn-site-preview-open {
+    flex: 1 1 calc(33% - 6px);
+    min-height: var(--touch);
+  }
+
+  .image-lightbox-close {
+    width: var(--touch);
+    height: var(--touch);
+    top: calc(10px + var(--safe-t));
+    right: 10px;
+  }
+
+  .toast-with-action .toast-action {
+    min-height: var(--touch);
+    padding: 8px 12px;
+  }
+}
+
+@media (hover: none) and (pointer: coarse) {
+  .btn,
+  .btn-sm,
+  .kind-chip,
+  .rail-tab,
+  .session-row,
+  .home-session-row,
+  .project-row,
+  .slash-item,
+  .ask-user-opt {
+    touch-action: manipulation;
+  }
+
+  .session-pin,
+  .session-rename-btn,
+  .session-delete-btn {
+    opacity: 0.9;
+  }
+}
+
+/* ── Pretty home + mobile chrome (v20260905p) ───────────────────────────
+   System-ui cards, hide idle rail/composer junk, bottom sheets.
+   Touch ≥44px from the prior pass is preserved. Desktop ≥900px stays compact. */
+#app.is-home .composer-shell,
+#app.is-home .turn-strip,
+#app.is-home .usage-bar,
+#app.is-home .plan-await-banner,
+#app.is-home .goal-banner,
+#app.is-home .capacity-banner,
+#app.is-home .latency-hint-banner,
+#app.is-home .session-banner {
+  display: none !important;
+}
+
+#app.is-home .chat-sub {
+  display: none;
+}
+
+.home-session-row {
+  border-radius: 14px;
+  background: var(--surface-2);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.03);
+}
+
+.home-session-row .title {
+  font-family: var(--font-ui);
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.home-session-cta {
+  border-radius: 10px;
+}
+
+.sheet-handle {
+  display: none;
+  width: 36px;
+  height: 4px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--muted) 55%, transparent);
+  margin: 2px auto 10px;
+}
+
+@media (max-width: 899px) {
+  html,
+  body {
+    font-family: var(--font-ui);
+    font-size: 16px;
+    background: var(--bg);
+  }
+
+  h1, h2, h3, h4, .chat-title, .modal-header h2, .empty-card h2,
+  .home-sessions-heading, .brand-text {
+    font-family: var(--font-ui);
+  }
+
+  #btn-topbar-new:not(.hidden) {
+    display: inline-flex;
+    flex-shrink: 0;
+    min-height: var(--touch);
+    min-width: 72px;
+    font-weight: 700;
+  }
+
+  #app.is-home #status-pill {
+    display: none;
+  }
+
+  #app:not(.is-home) #btn-topbar-new {
+    display: none !important;
+  }
+
+  .topbar {
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    border-bottom-color: color-mix(in srgb, var(--border) 80%, transparent);
+  }
+
+  .chat-title {
+    font-size: 17px;
+    font-weight: 650;
+  }
+
+  /* Empty home: real cards, not a dashed HTML dump */
+  .empty-main {
+    display: block;
+    padding: 20px 16px calc(28px + var(--safe-b));
+  }
+
+  .empty-card {
+    max-width: 100%;
+    padding: 22px 18px 18px;
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    background: var(--surface);
+    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.35);
+  }
+
+  .empty-card h2 {
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    color: var(--text);
+  }
+
+  .empty-card p,
+  .empty-lead,
+  .empty-sub {
+    font-size: 15px;
+    line-height: 1.45;
+  }
+
+  .home-sessions-heading {
+    font-size: 12px;
+    letter-spacing: 0.08em;
+  }
+
+  .home-session-row {
+    min-height: 64px;
+    padding: 14px 14px;
+    border-radius: 14px;
+    background: var(--bg);
+    border-color: var(--border);
+  }
+
+  .home-session-row .title {
+    font-size: 16px;
+  }
+
+  .home-session-cta {
+    min-height: var(--touch);
+    padding: 10px 16px;
+    border-radius: 10px;
+  }
+
+  .empty-actions {
+    margin-top: 8px;
+  }
+
+  /* Composer: sticky, primary Send */
+  .composer-shell {
+    position: sticky;
+    bottom: 0;
+    background: color-mix(in srgb, var(--surface) 94%, transparent);
+    backdrop-filter: blur(12px);
+    border-top-color: color-mix(in srgb, var(--border) 80%, transparent);
+    padding: 4px 4px calc(6px + var(--safe-b));
+  }
+
+  .composer {
+    border-radius: 16px;
+    background: var(--bg);
+    padding: 2px 2px;
+    box-shadow: inset 0 0 0 1px var(--border);
+  }
+
+  #btn-send {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #1a1200;
+    font-weight: 700;
+    border-radius: 12px;
+  }
+
+  /* Bottom sheets — flex-end so short cards still sit on the thumb edge */
+  .modal {
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    align-items: stretch;
+    padding: 0;
+    place-items: unset;
+  }
+
+  .modal-backdrop {
+    background: rgba(0, 0, 0, 0.62);
+  }
+
+  .modal-card,
+  .modal-card-ask,
+  .modal-card-plan,
+  .modal-card-site-preview {
+    width: 100%;
+    max-width: 100%;
+    min-height: min(58dvh, 520px);
+    max-height: min(92dvh, 100%);
+    border-radius: 20px 20px 0 0;
+    border: 1px solid var(--border);
+    border-bottom: none;
+    padding: 10px 16px calc(16px + var(--safe-b));
+    box-shadow: 0 -16px 48px rgba(0, 0, 0, 0.45);
+  }
+
+  .sheet-handle {
+    display: block;
+    width: 44px;
+    height: 5px;
+    background: color-mix(in srgb, var(--text) 35%, transparent);
+  }
+
+  .modal-header h2 {
+    font-size: 20px;
+    font-weight: 700;
+  }
+
+  .project-mode-tabs {
+    border-radius: 12px;
+    padding: 4px;
+  }
+
+  .project-mode-tab {
+    border-radius: 10px;
+    font-weight: 600;
+  }
+
+  .project-row,
+  .browse-folder-row,
+  .project-entry-row {
+    border-radius: 12px;
+    background: var(--surface-2);
+    border-color: var(--border);
+  }
+
+  .project-use-btn,
+  #btn-browse-start,
+  #btn-entry-start-new,
+  #btn-ask-user-submit,
+  #btn-plan-approve {
+    border-radius: 12px;
+    font-weight: 700;
+  }
+
+  /* File media: never show empty chrome when wraps are hidden */
+  .file-image-wrap.hidden,
+  .file-video-wrap.hidden,
+  .file-panel.hidden {
+    display: none !important;
+  }
+
+  .file-image:not([src]),
+  .file-image[src=""],
+  .file-video:not([src]) {
+    display: none;
+  }
+
+  .file-image-wrap:not(.hidden),
+  .file-video-wrap:not(.hidden) {
+    background: var(--surface);
+    border-radius: 12px;
+    margin: 8px;
+  }
+
+  /* Rail drawer: hide collapse control (desktop-only) */
+  #btn-rail-collapse {
+    display: none !important;
+  }
+
+  .rail {
+    background: var(--surface);
+    border-right-color: var(--border);
+  }
+
+  .brand-text {
+    font-size: 16px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+  }
+
+  .rail-tab,
+  .kind-chip {
+    font-family: var(--font-ui);
+    font-weight: 600;
+  }
+
+  .session-row {
+    background: var(--surface-2);
+    border-radius: 12px;
+  }
+
+  .session-row .title {
+    font-family: var(--font-ui);
+    font-weight: 600;
+  }
+
+  .error-strip {
+    border-radius: 0;
+    padding: 12px;
+  }
+
+  .status-pill {
+    border-radius: 999px;
+  }
+}
+
+/* Android resume chat: native app owns the list, this view is the transcript.
+   Do not use display:block or max-height:100dvh here. A zero dvh in the WebView
+   clips the whole pane to black, and a block app collapses the chat column. */
+html.embed-chat,
+html.embed-chat body {
+  height: 100%;
+  min-height: 100%;
+  background: var(--bg);
+  color: var(--text);
+}
+html.embed-chat #app {
+  display: flex !important;
+  flex-direction: row;
+  width: 100%;
+  height: 100% !important;
+  min-height: 100% !important;
+  max-height: none !important;
+  overflow: hidden;
+}
+html.embed-chat #rail,
+html.embed-chat #rail-backdrop,
+html.embed-chat #btn-menu,
+html.embed-chat #btn-rail-collapse,
+html.embed-chat #btn-topbar-new,
+html.embed-chat #empty-main {
+  display: none !important;
+}
+html.embed-chat .main {
+  flex: 1 1 auto;
+  width: auto;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+html.embed-chat .chat-panel,
+html.embed-chat .transcript-wrap {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+html.embed-chat .composer-shell,
+html.embed-chat #app.is-home .composer-shell {
+  display: flex !important;
+  flex-direction: column !important;
+  align-items: stretch;
+  width: 100% !important;
+  max-width: 100%;
+  flex-shrink: 0;
+  visibility: visible !important;
+  box-sizing: border-box;
+}
+html.embed-chat #app.is-home .turn-strip {
+  display: flex !important;
+  flex-shrink: 0;
+  visibility: visible !important;
+}
+html.embed-chat .composer,
+html.embed-chat #composer-form {
+  display: flex !important;
+  flex-direction: row !important;
+  align-items: flex-end;
+  width: 100% !important;
+  min-width: 0;
+}
+html.embed-chat #composer-input {
+  display: block !important;
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+  min-height: 44px;
+  max-height: 8.5em;
+  visibility: visible !important;
+  opacity: 1 !important;
+}
+/* Native app already shows the session title. Keep the chip row. */
+@media (max-width: 899px) {
+  html.embed-chat .topbar-title-row {
+    display: none;
+  }
+  html.embed-chat .topbar {
+    height: auto;
+    min-height: 44px;
   }
 }

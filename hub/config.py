@@ -28,9 +28,19 @@ TAILSCALE_EXE = Path(r"C:\Program Files\Tailscale\tailscale.exe")
 
 
 def _default_grok_bin() -> str:
+    """Prefer ~/.grok/bin/grok.exe over a PATH grok.bat shim."""
+    from hub.grok_bin import prefer_grok_exe
+
+    for candidate in DEFAULT_GROK_BIN_CANDIDATES:
+        if candidate.is_file() and candidate.suffix.lower() != ".bat":
+            return str(candidate)
     found = shutil.which("grok")
     if found:
-        return found
+        preferred = prefer_grok_exe(found)
+        if preferred and not preferred.lower().endswith(".bat"):
+            return preferred
+        if not found.lower().endswith(".bat"):
+            return found
     for candidate in DEFAULT_GROK_BIN_CANDIDATES:
         if candidate.is_file():
             return str(candidate)

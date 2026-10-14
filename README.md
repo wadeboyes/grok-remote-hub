@@ -67,6 +67,9 @@ The stock Grok CLI TUI is excellent on the desktop, but it is a **single local p
 - **New session** — Projects | Browse folder picker with Recent, breadcrumbs, and **Use this folder**
 - **Live stream** — multi-browser WebSocket fan-out; mid-turn switch keeps continuity; turn stop/clear cancels agent (CLI-aligned); wake re-syncs stuck turns
 - **Agent status** — pill and `/health` distinguish process up vs ACP connected **and** ACP quality (`ok`/`stale`/`zombie`); auto-reconnect when process is up; after heal exhaustion, **click the hung pill** to restart the agent serve (hub stays up)
+- **Busy agent blip.** A long Grok turn that misses a websocket pong is not marked zombie. The hub reconnects, loads the same session, and keeps streaming. The chat says "Connection to Grok blipped, reconnected. Grok may still be working."
+- **Stuck tool after a drop.** If resume finds a tool still pending, the hub cancels that turn and checks that Grok ended it. One prompt follows. If Grok stays silent, the hub restarts the Grok process when no other session is in a turn, then loads the same session. It does not send that prompt again. The chat shows one banner. A permission or question that comes back after the load is shown for you to answer. Windows terminals start with powershell.exe -NoLogo.
+- **Phone composer.** The embedded chat keeps one full-width row at the bottom: attach on the left, the message on the right of it, Send at the end. Status is one short line above that row. The app bar already shows the session title, so the page does not repeat it.
 - **Honest `/compact`** — same ACP compact path as the CLI remote; feedback grounded in session `signals.json` (not cheerful no-ops)
 - **Plan mode (Hub)** — View plan appears **inline** when awaiting/Active; Approve writes `plan_mode.json` (not stock TUI `exit_plan_mode`)
 - **History** — hydrate from `updates.jsonl` when you open a session; load quiet-period suppress avoids history flood thrash
@@ -98,7 +101,7 @@ Node 18+ (ES modules), stdlib only. Separate from the Python hub on `:8787`.
 - **Sole-writer prompts** — live turns use hub-owned `session/new`
 - **Dual browser, not dual TUI** — phone + desktop share this process; stock TUI is separate
 
-Design write-ups: **[docs/adr/](docs/adr/)** (ADR 001–020).
+Design write-ups: **[docs/adr/](docs/adr/)** (ADR 001 to 021).
 
 | Path | Live together? | Notes |
 |---|---|---|
@@ -168,7 +171,22 @@ http://127.0.0.1:8787          # this PC only
    ```
 
 5. Optional: **Add to Home Screen** for an app-like shell.
-6. Pick a session under **Working**, wait for history + load, then chat.
+6. On the empty home, tap a **Working** session to resume (or **New session** → pick folder → **Start new session**). Wait for history + load, then chat.
+
+### Reload the UI after an update (PC install)
+
+Static files live in `static/` (`index.html`, `app.css`, `app.js`). The Python hub/ACP process does not need a rebuild for CSS/JS, but browsers cache aggressively.
+
+1. On the PC, pull the branch and restart so the process is serving the new files:
+
+   ```powershell
+   git pull
+   .\restart-hub.ps1
+   ```
+
+2. On the phone, **hard-refresh** (Brave: tap the lock/menu → Refresh, or close the tab and reopen `http://<tailscale-ip>:8787`). Look for `app.css?v=20260905q` / `app.js?v=20260905q` (or newer) — the query must match the new `index.html`.
+
+A hub restart is enough after a Python change; a phone hard-refresh is required after a `static/` change even if the hub stayed up.
 
 ### If Safari still will not load
 
@@ -181,6 +199,52 @@ http://127.0.0.1:8787          # this PC only
 | Optional HTTPS | Tailscale Serve → `tailscale serve --bg http://127.0.0.1:8787` |
 
 Without Tailscale the hub binds **localhost only** and the UI shows **Local only**.
+
+---
+
+## Android app
+
+Sideload **Grok Remote** on the Galaxy S24 Ultra and the Galaxy Tab S10. The same APK is a narrow single column on the phone and a two pane layout when the window is at least 600dp wide (tablet landscape, and tablet portrait when it is wide). Touch targets are at least 48dp.
+
+The home list is every Grok Build session under `~/.grok/sessions` plus git worktrees under `~/.grok/worktrees`, newest first. It is not limited to a grok-builds folder. Each row has a stored plain English summary (what it is, what was being built, where it got to, what is next). The hub reads the session conversation (`chat_history.jsonl`, `prompt_history.jsonl`, and updates or events when needed), including the opening request and the latest turns on long sessions. A session with that history gets a real title instead of "Untitled session". Summaries refresh when those files change. The list does not wait on the model.
+
+One tap on **Resume** calls `POST /api/build/resume`. The hub uses `grok.exe --cwd <dir> --resume <session-id>` (never `grok.bat`) through the existing agent, then the app opens that chat. A worktree resumes the latest session in its folder. It starts a fresh session only when that folder has none. The embedded page gets the same `hub_token` on its asset URLs and as a cookie, so the websocket can connect and the session opens. The embedded view hides the "No session selected" home text, shows the history or "No messages yet", and keeps the composer on screen.
+
+| Route | Role |
+|---|---|
+| `GET /api/build/index` | Sessions, worktrees, stored summaries, archive flags |
+| `POST /api/build/summaries/refresh` | Schedule a summary refresh |
+| `POST /api/build/resume` | Resume or restart, return `chatPath` |
+| `POST /api/build/archive` | Hide a session or worktree from the main lists |
+| `POST /api/build/restore` | Show an archived session or worktree again |
+| `POST /api/build/worktree/remove` | `git worktree remove` for one worktree under `~/.grok/worktrees` |
+| `GET /api/notify/poll` | Long-poll `turn_end` and `pending_question` for phone alerts |
+
+**Archive** hides a card from All, Sessions, and Worktrees and puts it on Archived, with Restore. The hub stores that in `data/archive.json` (session id or worktree path) so both devices match. It does not change `~/.grok/sessions`. The app shows an undo snackbar after archive.
+
+**Remove** is worktrees only. The app asks first, naming the folder and branch, and says it can't be undone. The hub runs `git worktree remove` in the parent repo and does not delete the branch. If the worktree has uncommitted changes or unpushed commits, the hub refuses until a second **Remove anyway**, which passes `--force`. Anything outside `~/.grok/worktrees`, and the main checkout, is refused. Remove also archives that worktree's session.
+
+These routes use the same `hub_token` check as the rest of the hub. There is no guest mode. Auto approve on `grok agent serve` is unchanged.
+
+**Session alerts.** With several turns at once, the phone and the tablet can show a notification when any session finishes, stops with an error, or is waiting on you (a question, or a plan that still needs approval). The shade shows the session title and a short line: "Finished", "Stopped with an error", or "Needs your answer". Notifications for one session stay in that session's group. The chat open on that device stays quiet. Tap the notification to open that session. There is no FCM. The app keeps a quiet "Watching sessions" notice and long-polls `GET /api/notify/poll`. If that watch stops, a backup check runs about every 15 minutes. **Session alerts** in Settings is on by default. Android asks for notification permission.
+
+The app checks the hub for a newer build on launch and every 3 hours. The manifest is `GET /app/update.json` and the file is `GET /app/GrokRemote-<version>.apk`, both behind `hub_token`. Publishing is `python tools/publish_update.py <apk> <channel>` into `data/app-updates/` (not committed). GitHub Releases are not used, because this repo is public.
+
+Build, keystore, install, and the exact ship steps: [android/README.md](android/README.md).
+
+### Pull this build on the PC
+
+The PC clone at `C:\Users\WADEBOYES\grok-remote-hub` may still have `origin` pointing at `wadeobyes/grok-remote-hub`. This branch lives on `wadeboyes/grok-remote-hub`. Add that remote, then restart:
+
+```powershell
+cd C:\Users\WADEBOYES\grok-remote-hub
+git remote add wadeboyes https://github.com/wadeboyes/grok-remote-hub.git
+git fetch wadeboyes
+git checkout -B cursor/android-grok-build-v1 wadeboyes/cursor/android-grok-build-v1
+.\restart-hub.ps1
+```
+
+If the remote name `wadeboyes` already exists, skip `git remote add` and run `git fetch wadeboyes`.
 
 ---
 

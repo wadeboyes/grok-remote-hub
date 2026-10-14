@@ -14,6 +14,43 @@ log = logging.getLogger("hub.acp.terminal")
 DEFAULT_OUTPUT_BYTE_LIMIT = 1_000_000
 WAIT_EXIT_CAP_SECONDS = 120.0
 
+
+def shell_launch_argv(command: str) -> list[str]:
+    """Argv for a shell command. Windows uses PowerShell, not cmd.exe.
+
+    Grok falls back to cmd when the hub terminal looks like a generic shell.
+    powershell.exe -NoLogo keeps the desktop-heap cost down and matches the
+    shell Wade expects. Non-Windows stays on sh.
+    """
+    text = str(command or "")
+    if os.name == "nt":
+        return [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            text,
+        ]
+    return ["sh", "-c", text]
+
+
+def taskkill_tree_argv(pid: int) -> list[str]:
+    """Kill a Windows process and the children it spawned."""
+    return ["taskkill", "/PID", str(int(pid)), "/T", "/F"]
+
+
+def _kill_windows_tree(pid: int) -> None:
+    import subprocess
+
+    subprocess.run(
+        taskkill_tree_argv(pid),
+        capture_output=True,
+        text=True,
+        timeout=8,
+        check=False,
+    )
+
 # (terminal_id, delta_text, session_id | None) — sync or async ok
 OutputCallback = Callable[[str, str, str | None], Any]
 
@@ -199,12 +236,23 @@ class ManagedTerminal:
         proc = self.process
         if proc.returncode is not None:
             return
+        pid = proc.pid
         try:
-            proc.kill()
+            if os.name == "nt" and pid:
+                await asyncio.to_thread(_kill_windows_tree, pid)
+            else:
+                proc.kill()
         except ProcessLookupError:
             pass
         except Exception as exc:
             log.debug("kill terminal %s: %s", self.terminal_id, exc)
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
 
     async def release(self) -> None:
         await self.kill()
@@ -283,15 +331,17 @@ class TerminalManager:
         session_raw = params.get("sessionId") or params.get("session_id")
         session_id = str(session_raw) if session_raw else None
 
-        # Prefer exec when we have a real executable + args. Use shell when the
-        # command string looks like a pipeline / bare shell builtin (dir, Get-ChildItem).
+        # Prefer exec when we have a real executable + args. Shell commands
+        # (pipelines, builtins) go through an explicit shell argv. On Windows
+        # that is powershell.exe -NoLogo, never the cmd shell.
         use_shell = (not args) and (
             any(ch in command for ch in ("|", ">", "<", "&", ";", "\n"))
             or (" " in command and not os.path.isfile(command))
         )
         if use_shell:
-            proc = await asyncio.create_subprocess_shell(
-                command,
+            argv = shell_launch_argv(command)
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
                 cwd=cwd,
                 env=env,
                 stdout=asyncio.subprocess.PIPE,
@@ -310,10 +360,10 @@ class TerminalManager:
                     stdin=asyncio.subprocess.DEVNULL,
                 )
             except FileNotFoundError:
-                # Windows often needs shell for bare commands like `dir`
                 shell_cmd = command if not args else " ".join([command, *args])
-                proc = await asyncio.create_subprocess_shell(
-                    shell_cmd,
+                argv = shell_launch_argv(shell_cmd)
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
                     cwd=cwd,
                     env=env,
                     stdout=asyncio.subprocess.PIPE,

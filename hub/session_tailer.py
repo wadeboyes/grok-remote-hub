@@ -329,7 +329,7 @@ class SessionTailer:
             items = list(self._watched.items())
         for session_id, watch in items:
             try:
-                lines = watch.read_new_lines()
+                lines = await asyncio.to_thread(watch.read_new_lines)
             except Exception:
                 log.exception("read failed for session %s", session_id)
                 continue

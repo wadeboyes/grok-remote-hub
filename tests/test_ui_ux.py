@@ -762,14 +762,15 @@ def test_js_turn_idle_clears_selected_strip() -> None:
     turn_chunk = js[turn_idx : turn_idx + 4500]
     assert 'msg.state === "idle"' in turn_chunk
     assert "isRecoverableTurnClear" in turn_chunk
-    assert "reportInfo" in turn_chunk
+    assert "setSessionNotice" in turn_chunk
     assert "forceIdleFlags" in turn_chunk
     assert "turnStartedAt = null" in turn_chunk
     assert "lastTermLineAt = null" in turn_chunk
     assert "clearStallWatch" in turn_chunk
     assert "turnRunningOnSelected" in turn_chunk
-    assert 'role: "system"' in turn_chunk
     assert "updateTurnStrip" in turn_chunk
+    # One banner. The same event is not also a transcript line.
+    assert 'role: "system"' not in turn_chunk
     # Explicit idle flag must beat stale sessions-list liveStatus
     status_fn = js.find("function sessionLiveStatus")
     assert status_fn >= 0
@@ -1004,7 +1005,8 @@ def test_js_on_user_question_flags_rail() -> None:
     js = (STATIC / "app.js").read_text(encoding="utf-8")
     idx = js.find("function onUserQuestion")
     assert idx >= 0
-    chunk = js[idx : idx + 1600]
+    end = js.find("function onUserQuestionResolved", idx)
+    chunk = js[idx:end]
     assert "pendingQuestionSessions" in chunk
     assert 'markSessionActivity(sessionId, "question")' in chunk
     assert "Waiting for your answer" in chunk
