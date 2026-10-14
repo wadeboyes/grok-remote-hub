@@ -270,7 +270,10 @@ def test_summary_refresh_uses_grok_p_and_updates_when_fingerprint_changes(tmp_pa
     changed = build_items(sessions, tmp_path, limit=10)[0]
     assert changed["fingerprint"] != item["fingerprint"]
     catalog = build_catalog(sessions, tmp_path, store, limit=10)
-    assert catalog["items"][0]["summary"]["stale"] is True
+    # History changes rebuild the visible summary immediately and queue grok again.
+    assert catalog["items"][0]["summary"]["stale"] is False
+    assert catalog["items"][0]["summary"]["source"] == "local"
+    assert "Phone app" in catalog["items"][0]["summary"]["text"]
     assert grok_due(store.get(f"session:{SID_SIDE}"), changed["fingerprint"])
 
 

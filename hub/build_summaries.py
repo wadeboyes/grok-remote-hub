@@ -17,15 +17,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from hub.history import parse_updates_jsonl
+from hub.build_transcript import (
+    Conversation,
+    is_placeholder_summary,
+    is_untitled_title,
+    load_conversation,
+)
 from hub.session_index import delete_session
 
 SUMMARY_VERSION = 1
+# Bump when the transcript reader changes so stored filler summaries rebuild.
+SUMMARY_LOGIC_VERSION = 2
 # Scratch cwd marker. Sessions created by headless summary runs are excluded
 # from the build index and deleted after the CLI returns.
 SUMMARY_SCRATCH_MARK = ".grok-hub-summary"
 GROK_RETRY_S = 30 * 60
-_TAIL_BYTES = 180_000
 _CLIP = 360
 
 _EM = "\u2014"
@@ -170,13 +176,59 @@ def item_key(kind: str, item_id: str) -> str:
     return f"{kind}:{item_id}"
 
 
+def _fingerprint_map(fingerprint: str) -> dict[str, str]:
+    found: dict[str, str] = {}
+    for part in (fingerprint or "").split("|"):
+        if ":" not in part:
+            continue
+        name, rest = part.split(":", 1)
+        if name:
+            found[name] = rest
+    return found
+
+
+def _tracked_files_unchanged(stored: str, current: str) -> bool:
+    """True when every present transcript file still matches the stored fingerprint."""
+    old = _fingerprint_map(stored)
+    new = _fingerprint_map(current)
+    if not old or not new:
+        return False
+    for name, rest in new.items():
+        if rest == "missing":
+            continue
+        if old.get(name) != rest:
+            return False
+    return True
+
+
+def record_is_current(record: dict[str, Any] | None, fingerprint: str) -> bool:
+    """False when the stored summary is filler or the transcript files changed."""
+    if not record or not isinstance(record.get("summary"), dict):
+        return False
+    summary = record.get("summary") or {}
+    if not str(summary.get("text") or "").strip():
+        return False
+    if is_placeholder_summary(summary):
+        return False
+    stored = str(record.get("fingerprint") or "")
+    if stored == fingerprint:
+        return True
+    # A real grok summary can survive a fingerprint shape change.
+    # Filler text is already rejected above. File edits still miss.
+    return str(record.get("source") or "") == "grok" and _tracked_files_unchanged(stored, fingerprint)
+
+
 def grok_due(record: dict[str, Any] | None, fingerprint: str, now: datetime | None = None, *, force: bool = False) -> bool:
     """True when a headless grok -p refresh should run."""
     if force:
         return True
     if not record:
         return True
-    if str(record.get("fingerprint") or "") != fingerprint:
+    stored = str(record.get("fingerprint") or "")
+    if stored != fingerprint and not _tracked_files_unchanged(stored, fingerprint):
+        return True
+    summary = record.get("summary") if isinstance(record.get("summary"), dict) else None
+    if summary is not None and is_placeholder_summary(summary):
         return True
     if str(record.get("source") or "") == "grok":
         return False
@@ -187,120 +239,66 @@ def grok_due(record: dict[str, Any] | None, fingerprint: str, now: datetime | No
     return (current - attempted).total_seconds() >= GROK_RETRY_S
 
 
-def _tail_bytes(path: Path, limit: int = _TAIL_BYTES) -> str:
-    try:
-        size = path.stat().st_size
-    except OSError:
-        return ""
-    try:
-        with path.open("rb") as handle:
-            if size > limit:
-                handle.seek(size - limit)
-                handle.readline()
-            data = handle.read()
-    except OSError:
-        return ""
-    return data.decode("utf-8", errors="replace")
-
-
-def _messages_from_updates(session_dir: Path) -> list[dict[str, Any]]:
-    updates = session_dir / "updates.jsonl"
-    if not updates.is_file():
-        return []
-    # parse_updates_jsonl reads the whole file. Cap by copying a tail into a
-    # temp-less in-memory parse when the file is huge.
-    try:
-        size = updates.stat().st_size
-    except OSError:
-        return []
-    if size <= _TAIL_BYTES:
-        return parse_updates_jsonl(updates, max_messages=80)
-    text = _tail_bytes(updates)
-    # Reuse the parser via a sibling-free write in the same dir is risky.
-    # Parse line by line with the same public function on a memory file.
-    from tempfile import NamedTemporaryFile
-
-    try:
-        with NamedTemporaryFile("w", encoding="utf-8", suffix=".jsonl", delete=False) as tmp:
-            tmp.write(text)
-            tmp_path = Path(tmp.name)
-        try:
-            return parse_updates_jsonl(tmp_path, max_messages=80)
-        finally:
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
-    except OSError:
-        return []
-
-
-def _last_role(messages: list[dict[str, Any]], role: str) -> str:
-    for msg in reversed(messages):
-        if msg.get("role") == role:
-            text = plain(str(msg.get("text") or ""))
-            if text:
-                return text
-    return ""
-
-
-def _open_plan(messages: list[dict[str, Any]]) -> str:
-    for msg in reversed(messages):
-        if msg.get("role") != "plan":
-            continue
-        entries = (msg.get("meta") or {}).get("entries") or []
-        if not isinstance(entries, list):
-            continue
-        pending: list[str] = []
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            status = str(entry.get("status") or "").lower()
-            if status in {"completed", "complete", "done", "cancelled", "canceled"}:
-                continue
-            content = plain(str(entry.get("content") or ""))
-            if content:
-                pending.append(content)
-        if pending:
-            return pending[0]
-    return ""
-
-
-def excerpt_for_session(session_dir: Path, *, title: str, cwd: str, quick: bool) -> dict[str, str]:
-    summary: dict[str, Any] = {}
+def _saved_session_summary(session_dir: Path) -> str:
     summary_path = session_dir / "summary.json"
-    if summary_path.is_file():
-        try:
-            loaded = json.loads(summary_path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                summary = loaded
-        except (OSError, json.JSONDecodeError, UnicodeError):
-            summary = {}
-    session_summary = plain(str(summary.get("session_summary") or ""))
-    last_user = ""
-    last_assistant = ""
-    plan = ""
-    if not quick:
-        messages = _messages_from_updates(session_dir)
-        last_user = _last_role(messages, "user")
-        last_assistant = _last_role(messages, "assistant")
-        plan = _open_plan(messages)
+    if not summary_path.is_file():
+        return ""
+    try:
+        loaded = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return ""
+    if not isinstance(loaded, dict):
+        return ""
+    return plain(str(loaded.get("session_summary") or ""))
+
+
+def _format_turns(turns: list[tuple[str, str]], limit: int = 4) -> str:
+    lines: list[str] = []
+    for role, text in turns[-limit:]:
+        label = "User" if role == "user" else "Assistant"
+        lines.append(f"{label}: {clip(text, 400)}")
+    return "\n".join(lines)
+
+
+def excerpt_for_session(session_dir: Path, *, title: str, cwd: str, quick: bool = False) -> dict[str, str]:
+    """Transcript excerpt. ``quick`` is ignored: the list needs the real conversation."""
+    del quick
+    conversation = load_conversation(session_dir) if session_dir.is_dir() else Conversation()
+    saved = _saved_session_summary(session_dir) if session_dir.is_dir() else ""
+    derived = conversation.display_title()
+    shown = plain(title)
+    if is_untitled_title(shown):
+        shown = derived
     folder = Path(cwd).name if cwd else ""
+    first_users = [clip(text, 400) for text in conversation.first_users[:3]]
+    latest_user = ""
+    latest_assistant = ""
+    for role, text in reversed(conversation.recent):
+        if role == "assistant" and not latest_assistant:
+            latest_assistant = text
+        if role == "user" and not latest_user:
+            latest_user = text
+    opening = first_users[0] if first_users else ""
     return {
-        "title": plain(title),
+        "title": shown,
+        "displayTitle": derived or shown,
         "cwd": plain(cwd),
         "folder": plain(folder),
-        "sessionSummary": session_summary,
-        "lastUser": clip(last_user, 500),
-        "lastAssistant": clip(last_assistant, 500),
-        "openPlan": clip(plan, 240),
+        "sessionSummary": saved,
+        "hasUserTurns": "yes" if conversation.has_user_turns else "no",
+        "firstUsers": "\n".join(first_users),
+        "recentTurns": _format_turns(conversation.recent),
+        "lastUser": clip(opening or latest_user, 500),
+        "lastAssistant": clip(latest_assistant, 500),
+        "openPlan": clip(conversation.open_plan, 240),
     }
 
 
 def local_summary_from_excerpt(excerpt: dict[str, str], *, kind: str) -> dict[str, str]:
     title = excerpt.get("title") or ""
     folder = excerpt.get("folder") or excerpt.get("repoName") or "a project"
-    if kind == "worktree" and not excerpt.get("sessionId"):
+    has_user = excerpt.get("hasUserTurns") == "yes"
+    if kind == "worktree" and not excerpt.get("sessionId") and not has_user:
         repo = excerpt.get("repoName") or folder or "a repository"
         path = excerpt.get("cwd") or "an isolated checkout"
         return summary_fields(
@@ -309,26 +307,35 @@ def local_summary_from_excerpt(excerpt: dict[str, str], *, kind: str) -> dict[st
             "No linked session notes are stored on this worktree yet.",
             "Next, restart a session in this worktree and keep working from the phone.",
         )
-    label = f" called {title}" if title and title.lower() not in {"untitled session", "untitled"} else ""
     noun = "worktree session" if kind == "worktree" else "session"
-    what = f"This is a Grok Build {noun}{label} in {folder}."
-    built_src = excerpt.get("sessionSummary") or excerpt.get("lastUser") or ""
-    if built_src:
-        built = f"It was building: {clip(built_src, 320)}"
+    place = f" in {folder}" if folder else ""
+    if not has_user:
+        named = f" called {title}" if title and not is_untitled_title(title) else ""
+        return summary_fields(
+            f"This is a Grok Build {noun}{named}{place}.",
+            "No user request is stored in this session yet.",
+            "There is no conversation stored yet.",
+            "Next, resume the session and send the first request.",
+        )
+    label = title if title and not is_untitled_title(title) else "this work"
+    what = f"This is a Grok Build {noun} about {label}{place}."
+    opening = excerpt.get("lastUser") or excerpt.get("sessionSummary") or ""
+    if opening:
+        built = f"The work started with: {clip(opening, 320)}"
     else:
-        built = "What it was building was not written down in the session notes yet."
+        built = "The session has user requests, and the opening line could not be read."
     assistant = excerpt.get("lastAssistant") or ""
     if assistant:
-        progress = f"It got as far as: {clip(assistant, 320)}"
+        progress = f"The latest reply: {clip(assistant, 320)}"
     elif excerpt.get("sessionSummary"):
-        progress = "The saved session summary is the latest note of progress."
+        progress = f"The saved note of progress: {clip(excerpt.get('sessionSummary') or '', 320)}"
     else:
-        progress = "There is no assistant reply stored yet."
+        progress = "A user request is stored, and there is no assistant reply after it yet."
     plan = excerpt.get("openPlan") or ""
     if plan:
         nxt = f"Next: {clip(plan, 240)}"
     else:
-        nxt = "Next, resume the session and continue from the last request."
+        nxt = "Next, resume the session and continue this work."
     return summary_fields(what, built, progress, nxt)
 
 
@@ -345,16 +352,22 @@ def summary_prompt(excerpt: dict[str, str], *, kind: str) -> str:
         "progress: where the work got to, one sentence.",
         "next: what is next, one sentence.",
         "",
+        "If the transcript has a user request, describe that work.",
+        "Do not claim the session is empty when a user request is included below.",
+        "",
         f"Kind: {kind}",
         f"Title: {excerpt.get('title') or ''}",
         f"Folder: {excerpt.get('folder') or ''}",
         f"Path: {excerpt.get('cwd') or ''}",
         f"Saved summary: {excerpt.get('sessionSummary') or ''}",
-        f"Last user request: {excerpt.get('lastUser') or ''}",
-        f"Last assistant reply: {excerpt.get('lastAssistant') or ''}",
+        f"First user requests:\n{excerpt.get('firstUsers') or ''}",
+        f"Latest turns:\n{excerpt.get('recentTurns') or ''}",
         f"Open plan item: {excerpt.get('openPlan') or ''}",
     ]
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    if len(text) > 6000:
+        text = text[:6000]
+    return text
 
 
 def summary_argv(grok_exe: str, scratch_cwd: str, prompt: str) -> list[str]:
@@ -434,6 +447,8 @@ def make_record(
     summary: dict[str, str],
     grok_error: str = "",
     grok_attempt: bool = False,
+    display_title: str = "",
+    has_user_turns: bool = False,
 ) -> dict[str, Any]:
     row: dict[str, Any] = {
         "key": key,
@@ -441,6 +456,9 @@ def make_record(
         "id": item_id,
         "fingerprint": fingerprint,
         "source": source,
+        "summaryVersion": SUMMARY_LOGIC_VERSION,
+        "displayTitle": plain(display_title)[:120],
+        "hasUserTurns": bool(has_user_turns),
         "generatedAt": _now_iso(),
         "summary": summary,
         "grokError": plain(grok_error)[:300],
@@ -495,9 +513,20 @@ def attach_stored_summaries(
         key = item_key(str(item.get("kind") or ""), str(item.get("id") or ""))
         fingerprint = str(item.get("fingerprint") or "")
         record = store.get(key)
-        if record and isinstance(record.get("summary"), dict) and record["summary"].get("text"):
-            stale = str(record.get("fingerprint") or "") != fingerprint
-            item["summary"] = public_summary(record, stale=stale)
+        if record_is_current(record, fingerprint):
+            record = record or {}
+            if is_untitled_title(str(item.get("title") or "")) and is_untitled_title(
+                str(record.get("displayTitle") or "")
+            ):
+                path = item.get("path")
+                derived = load_conversation(Path(str(path))).display_title() if path else ""
+                if derived:
+                    record = dict(record)
+                    record["displayTitle"] = derived
+                    store.put(key, record, save=False)
+                    dirty = True
+            _apply_display_title(item, record)
+            item["summary"] = public_summary(record, stale=False)
             if grok_due(record, fingerprint):
                 due.append(key)
             continue
@@ -509,7 +538,10 @@ def attach_stored_summaries(
             fingerprint=fingerprint,
             source="local",
             summary=summary,
+            display_title=str(item.get("_displayTitle") or ""),
+            has_user_turns=bool(item.get("_hasUserTurns")),
         )
+        _apply_display_title(item, row)
         store.put(key, row, save=False)
         dirty = True
         item["summary"] = public_summary(row, stale=False)
@@ -517,6 +549,14 @@ def attach_stored_summaries(
     if dirty:
         store.save()
     return due
+
+
+def _apply_display_title(item: dict[str, Any], record: dict[str, Any]) -> None:
+    if not is_untitled_title(str(item.get("title") or "")):
+        return
+    shown = plain(str(record.get("displayTitle") or ""))
+    if shown and not is_untitled_title(shown):
+        item["title"] = shown
 
 
 def scratch_cwd(root: Path) -> Path:
@@ -587,99 +627,63 @@ def refresh_item_summary(
         )
         excerpt.update(deep)
     local = local_summary_from_excerpt(excerpt, kind=kind)
+    has_user = excerpt.get("hasUserTurns") == "yes"
+    display_title = str(excerpt.get("displayTitle") or "")
     existing = store.get(key)
-    if not grok_due(existing, fingerprint, force=force):
+    if record_is_current(existing, fingerprint) and not grok_due(existing, fingerprint, force=force):
         return existing or {}
 
-    # Store the file based summary first so a list read during grok -p is useful.
-    local_row = make_record(
-        key=key,
-        kind=kind,
-        item_id=item_id,
-        fingerprint=fingerprint,
-        source="local",
-        summary=local,
-    )
-    if existing and existing.get("grokAttemptAt") and not force:
-        local_row["grokAttemptAt"] = existing.get("grokAttemptAt")
-    store.put(key, local_row)
-
-    if runner is None and not _exe_exists(grok_exe):
-        failed = make_record(
+    def _store(summary: dict[str, str], *, source: str, grok_error: str = "", grok_attempt: bool = False) -> dict[str, Any]:
+        row = make_record(
             key=key,
             kind=kind,
             item_id=item_id,
             fingerprint=fingerprint,
-            source="local",
-            summary=local,
-            grok_error="grok.exe not found",
-            grok_attempt=True,
+            source=source,
+            summary=summary,
+            grok_error=grok_error,
+            grok_attempt=grok_attempt,
+            display_title=display_title,
+            has_user_turns=has_user,
         )
-        store.put(key, failed)
-        return failed
+        store.put(key, row)
+        return row
+
+    # Store the file based summary first so a list read during grok -p is useful.
+    _store(local, source="local")
+
+    if runner is None and not _exe_exists(grok_exe):
+        return _store(local, source="local", grok_error="grok.exe not found", grok_attempt=True)
 
     prompt = summary_prompt(excerpt, kind=kind)
     scratch = scratch_cwd(scratch_root)
     try:
         argv = summary_argv(grok_exe, str(scratch), prompt)
     except Exception as exc:
-        failed = make_record(
-            key=key,
-            kind=kind,
-            item_id=item_id,
-            fingerprint=fingerprint,
-            source="local",
-            summary=local,
-            grok_error=str(exc),
-            grok_attempt=True,
-        )
-        store.put(key, failed)
-        return failed
+        return _store(local, source="local", grok_error=str(exc), grok_attempt=True)
 
     call = runner or (lambda args, cwd: run_grok_summary_subprocess(args, cwd))
     try:
         stdout = call(argv, scratch)
     except Exception as exc:
-        failed = make_record(
-            key=key,
-            kind=kind,
-            item_id=item_id,
-            fingerprint=fingerprint,
-            source="local",
-            summary=local,
-            grok_error=str(exc),
-            grok_attempt=True,
-        )
-        store.put(key, failed)
-        return failed
+        return _store(local, source="local", grok_error=str(exc), grok_attempt=True)
 
     fields, spawned = parse_grok_summary_output(stdout)
     if spawned:
         cleanup_summary_session(sessions_root, spawned)
+    if fields and has_user and is_placeholder_summary(fields):
+        fields = None
+        grok_error = "grok -p ignored the transcript"
+    else:
+        grok_error = ""
     if not fields:
-        failed = make_record(
-            key=key,
-            kind=kind,
-            item_id=item_id,
-            fingerprint=fingerprint,
+        return _store(
+            local,
             source="local",
-            summary=local,
-            grok_error="grok -p did not return summary JSON",
+            grok_error=grok_error or "grok -p did not return summary JSON",
             grok_attempt=True,
         )
-        store.put(key, failed)
-        return failed
-    row = make_record(
-        key=key,
-        kind=kind,
-        item_id=item_id,
-        fingerprint=fingerprint,
-        source="grok",
-        summary=fields,
-        grok_attempt=True,
-    )
-    store.put(key, row)
-    return row
+    return _store(fields, source="grok", grok_attempt=True)
 
 
 def _exe_exists(grok_exe: str) -> bool:

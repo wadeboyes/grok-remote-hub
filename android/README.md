@@ -91,7 +91,7 @@ C:\Users\WADEBOYES\.grok\bin\grok.exe --cwd <dir> --resume <session-id>
 
 It does not launch a second interactive terminal. The hub agent (already started with `grok.exe`, not `grok.bat`) loads that folder and session, and the app opens the hub chat. Restart, when there is no session to resume, starts a new hub session in that folder with `session/new`.
 
-Summaries are written on the PC to `data/build_summaries.json`. The app only reads them. A headless `grok.exe -p` refresh runs when a session changes. That path does not pass `--always-approve`.
+Summaries are written on the PC to `data/build_summaries.json`. The hub reads `chat_history.jsonl` and `prompt_history.jsonl` (and updates or events when those hold the conversation), so a session with history gets a real title and the four summary lines. A headless `grok.exe -p` refresh can still refine that text. It does not pass `--always-approve`. The app only displays what the hub stored. Restart the hub after pulling this branch. A new APK is not required for the title and summary fix.
 
 ## Ship an update
 

@@ -9,6 +9,9 @@ This file is the **public narrative**. Session chat context is not required to u
 
 ## [Unreleased]
 
+### Fixed
+- **Session titles and summaries** now read `chat_history.jsonl`, `prompt_history.jsonl`, and updates or events when those are the conversation. Untitled sessions with history get a short title from the first user request. Stored filler summaries are rebuilt, and a history change refreshes the list text. Headless summary sessions under `data/.grok-hub-summary` stay off the list.
+
 ### Added
 - **Android self-update.** The app checks the hub on launch and every 3 hours, verifies SHA-256 and the signing certificate, then installs with the package installer session API. `python tools/publish_update.py <apk> <channel>` writes `data/app-updates/<channel>/update.json`. This build is 1.0.1 (versionCode 2) so it can install over 1.0.0. See `android/README.md`.
 - **Android sideload app** for the Galaxy S24 Ultra and the Galaxy Tab S10. Home lists every Grok Build session and worktree, newest first, with a stored plain English summary. One tap resumes with `grok.exe --cwd <dir> --resume <session-id>` (never grok.bat) and opens the hub chat. Wide screens use two panes. See `android/README.md`.

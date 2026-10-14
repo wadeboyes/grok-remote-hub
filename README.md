@@ -203,7 +203,7 @@ Without Tailscale the hub binds **localhost only** and the UI shows **Local only
 
 Sideload **Grok Remote** on the Galaxy S24 Ultra and the Galaxy Tab S10. The same APK is a narrow single column on the phone and a two pane layout when the window is at least 600dp wide (tablet landscape, and tablet portrait when it is wide). Touch targets are at least 48dp.
 
-The home list is every Grok Build session under `~/.grok/sessions` plus git worktrees under `~/.grok/worktrees`, newest first. It is not limited to a grok-builds folder. Each row has a stored plain English summary (what it is, what was being built, where it got to, what is next). Summaries are generated on the PC and refreshed when the session files change, so the list does not wait on the model.
+The home list is every Grok Build session under `~/.grok/sessions` plus git worktrees under `~/.grok/worktrees`, newest first. It is not limited to a grok-builds folder. Each row has a stored plain English summary (what it is, what was being built, where it got to, what is next). The hub reads the session conversation (`chat_history.jsonl`, `prompt_history.jsonl`, and updates or events when needed), including the opening request and the latest turns on long sessions. A session with that history gets a real title instead of "Untitled session". Summaries refresh when those files change. The list does not wait on the model.
 
 One tap on **Resume** (or **Restart** when a worktree has no session) calls `POST /api/build/resume`. The hub uses `grok.exe --cwd <dir> --resume <session-id>` (never `grok.bat`) through the existing agent, then the app opens the chat.
 

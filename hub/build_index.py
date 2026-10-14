@@ -14,6 +14,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from hub.build_summaries import (
     SUMMARY_SCRATCH_MARK,
@@ -71,8 +72,13 @@ def _sort_stamp(iso: str) -> float:
 
 
 def _is_summary_scratch(cwd: str, path: str = "") -> bool:
-    blob = f"{cwd} {path}".replace("\\", "/").lower()
-    return SUMMARY_SCRATCH_MARK.lower() in blob
+    """True for headless summary runs under data/.grok-hub-summary."""
+    raw = f"{cwd}\n{path}"
+    blob = unquote(raw).replace("\\", "/").lower()
+    mark = SUMMARY_SCRATCH_MARK.lower()
+    if mark in blob or mark in raw.replace("\\", "/").lower():
+        return True
+    return False
 
 
 def _label_from_metadata(raw: str | None) -> str:
@@ -214,7 +220,14 @@ def list_worktrees(grok_home: Path) -> list[dict[str, Any]]:
 
 
 def _session_fingerprint(session_dir: Path) -> str:
-    names = ["summary.json", "updates.jsonl", "chat_history.jsonl", "signals.json"]
+    names = [
+        "summary.json",
+        "updates.jsonl",
+        "chat_history.jsonl",
+        "prompt_history.jsonl",
+        "events.jsonl",
+        "signals.json",
+    ]
     return file_fingerprint([session_dir / name for name in names])
 
 
@@ -247,16 +260,17 @@ def _quick_summary_for_item(item: dict[str, Any]) -> dict[str, str]:
         "sessionId": str(item.get("sessionId") or ""),
     }
     path = item.get("path")
-    if path and item.get("kind") == "session":
-        # summary.json only, still cheap compared with updates.jsonl
+    if path:
         quick = excerpt_for_session(
             Path(str(path)),
             title=str(item.get("title") or ""),
             cwd=str(item.get("cwd") or ""),
-            quick=True,
         )
         excerpt.update(quick)
-    return local_summary_from_excerpt(excerpt, kind=str(item.get("kind") or "session"))
+    summary = local_summary_from_excerpt(excerpt, kind=str(item.get("kind") or "session"))
+    item["_displayTitle"] = str(excerpt.get("displayTitle") or "")
+    item["_hasUserTurns"] = excerpt.get("hasUserTurns") == "yes"
+    return summary
 
 
 def build_items(
@@ -379,6 +393,8 @@ def build_catalog(
         row = dict(item)
         row.pop("path", None)
         row.pop("fingerprint", None)
+        row.pop("_displayTitle", None)
+        row.pop("_hasUserTurns", None)
         public.append(row)
     return {
         "items": public,
