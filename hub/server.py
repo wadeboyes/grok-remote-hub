@@ -104,6 +104,13 @@ from hub.build_index import (
     grok_home_from_sessions,
 )
 from hub.build_summaries import SummaryStore, item_key, refresh_item_summary
+from hub.app_update import (
+    UpdateManifestError,
+    read_manifest,
+    resolve_update_apk,
+    sanitize_channel,
+    updates_root,
+)
 
 log = logging.getLogger("hub.server")
 
@@ -1665,6 +1672,10 @@ class Hub:
         app.router.add_get("/preview-site/", self.handle_preview_site)
         app.router.add_get("/preview-site/{path:.*}", self.handle_preview_site)
         app.router.add_get("/ws", self.handle_ws)
+        # Register before static / so update paths are not swallowed.
+        # These stay behind hub_token. /health is still the only skip.
+        app.router.add_get("/app/update.json", self.handle_app_update_manifest)
+        app.router.add_get("/app/{filename}", self.handle_app_update_apk)
         static_dir = Path(self.config.static_dir)
         if static_dir.is_dir():
             app.router.add_get("/", self.handle_index)
@@ -2409,6 +2420,70 @@ class Hub:
 
     def _grok_home(self) -> Path:
         return grok_home_from_sessions(self.config.sessions_root)
+
+    async def handle_app_update_manifest(self, request: web.Request) -> web.Response:
+        """Published sideload manifest. Missing file is 404, not an open route."""
+        channel = request.rel_url.query.get("channel") or "stable"
+        if sanitize_channel(channel) is None:
+            return web.json_response(
+                {"error": "invalid channel"},
+                status=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        try:
+            manifest = await asyncio.to_thread(read_manifest, updates_root(), channel)
+        except UpdateManifestError:
+            log.warning("app update manifest unreadable channel=%s", channel)
+            return web.json_response(
+                {"error": "update manifest is unreadable"},
+                status=500,
+                headers={"Cache-Control": "no-store"},
+            )
+        if manifest is None:
+            return web.json_response(
+                {"error": "no update published"},
+                status=404,
+                headers={"Cache-Control": "no-store"},
+            )
+        return web.json_response(manifest, headers={"Cache-Control": "no-store"})
+
+    async def handle_app_update_apk(self, request: web.Request) -> web.Response:
+        """The APK named by update.json. The token is the same check as the rest of the hub."""
+        channel = request.rel_url.query.get("channel") or "stable"
+        filename = request.match_info.get("filename") or ""
+        if sanitize_channel(channel) is None:
+            return web.json_response(
+                {"error": "invalid channel"},
+                status=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        status, path = await asyncio.to_thread(
+            resolve_update_apk, updates_root(), channel, filename
+        )
+        if status == "bad_manifest":
+            return web.json_response(
+                {"error": "update manifest is unreadable"},
+                status=500,
+                headers={"Cache-Control": "no-store"},
+            )
+        if status == "checksum":
+            log.warning("app update checksum mismatch channel=%s file=%s", channel, filename)
+            return web.json_response(
+                {"error": "checksum mismatch"},
+                status=409,
+                headers={"Cache-Control": "no-store"},
+            )
+        if path is None:
+            return web.json_response(
+                {"error": "not found"},
+                status=404,
+                headers={"Cache-Control": "no-store"},
+            )
+        response = web.FileResponse(path)
+        response.content_type = "application/vnd.android.package-archive"
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Content-Disposition"] = content_disposition_attachment(path.name)
+        return response
 
     async def handle_build_index(self, request: web.Request) -> web.Response:
         """All sessions and worktrees, newest first, with stored summaries."""

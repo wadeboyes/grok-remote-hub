@@ -11,13 +11,16 @@ Default hub URL: `http://100.113.227.9:8787`. Put the real `hub_token` in Settin
 
 ## Install on the phone or tablet
 
-1. Copy `GrokRemote-v1.apk` onto the device (USB, Drive, or a nearby share). Use the same file on the phone and the tablet.
+This build is **1.0.1** (versionCode 2). It installs over 1.0.0 because the versionCode is higher and the signing key is the same. 1.0.0 does not check for updates, so install this APK once. After that, newer builds can install from the hub.
+
+1. Copy `GrokRemote-v1.0.1.apk` onto the device (USB, Drive, or a nearby share). Use the same file on the phone and the tablet.
 2. Open the APK. If Android blocks it, allow that app (Files, Drive, or Chrome) to install unknown apps.
 3. Install. Later builds signed with the same keystore replace this install. You do not uninstall first.
 4. Connect Tailscale on the device, same tailnet as the PC.
 5. Open **Grok Remote**. Confirm the hub URL. Paste `hub_token` from the PC `config.toml`. Save.
 6. The list loads stored summaries. Tap **Resume** (or **Restart** on a worktree with no session) to open the chat.
 7. On the tablet, rotate to landscape. The list stays on the left and the summary or chat stays on the right.
+8. In Settings, allow Grok Remote to install unknown apps if Android asks. **Check for updates** shows the current version and the version published on the hub.
 
 The PC hub must be running this branch. See "Pull this build on the PC" in the repo README. Short form:
 
@@ -89,3 +92,38 @@ C:\Users\WADEBOYES\.grok\bin\grok.exe --cwd <dir> --resume <session-id>
 It does not launch a second interactive terminal. The hub agent (already started with `grok.exe`, not `grok.bat`) loads that folder and session, and the app opens the hub chat. Restart, when there is no session to resume, starts a new hub session in that folder with `session/new`.
 
 Summaries are written on the PC to `data/build_summaries.json`. The app only reads them. A headless `grok.exe -p` refresh runs when a session changes. That path does not pass `--always-approve`.
+
+## Ship an update
+
+The phone and the tablet ask the hub for updates. They do not use GitHub Releases. This repo is public, so the APK stays on the PC under `data/app-updates/`, which is not committed. `GET /app/update.json` and `GET /app/GrokRemote-<version>.apk` use the same `hub_token` as the rest of the hub. `/health` is still the only route that skips the token.
+
+The app reads the `stable` channel on launch and every 3 hours while it is open. Settings has **Check for updates**, with the current version and the available version.
+
+1. Bump `versionCode` and `versionName` in `android/app/build.gradle.kts`. This build is `1.0.1` (`versionCode` 2). The next build must use a higher `versionCode` than the one installed on the device.
+2. Build the release APK with the stable keystore:
+
+```powershell
+cd C:\Users\WADEBOYES\grok-remote-hub\android
+.\gradlew.bat assembleRelease
+```
+
+3. Publish it. The channel the app reads is `stable`:
+
+```powershell
+cd C:\Users\WADEBOYES\grok-remote-hub
+python tools\publish_update.py android\app\build\outputs\apk\release\app-release.apk stable
+```
+
+That writes `data\app-updates\stable\update.json` and copies the APK to `data\app-updates\stable\GrokRemote-<version>.apk`. The script reads `versionCode` and `versionName` from the APK and fills in the SHA-256.
+
+4. Restart the hub the first time you pull this update code, so the `/app` routes exist:
+
+```powershell
+.\restart-hub.ps1
+```
+
+After that, publishing again does not need a restart. The hub reads `update.json` from disk on each check.
+
+On the device the app downloads an APK only when its `versionCode` is higher. It checks the SHA-256 against the manifest, checks that the signing certificate matches the installed app, then installs with the package installer session API (`USER_ACTION_NOT_REQUIRED` and update ownership on Android 14+).
+
+The first copy on the phone or tablet is still a sideload from Drive, Files, or USB. That sideload may need one confirm tap. The first time this app installs a newer build itself, Android usually shows one more confirm, because Drive or Files is still the installer. After that confirm, Grok Remote is the installer of record and the update owner, and later updates can install with no prompt. Android can still show a prompt if it does not allow a silent install. The device also needs "install unknown apps" allowed for Grok Remote.

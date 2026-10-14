@@ -215,7 +215,9 @@ One tap on **Resume** (or **Restart** when a worktree has no session) calls `POS
 
 These routes use the same `hub_token` check as the rest of the hub. There is no guest mode. Auto approve on `grok agent serve` is unchanged.
 
-Build, keystore, and install steps: [android/README.md](android/README.md).
+The app checks the hub for a newer build on launch and every 3 hours. The manifest is `GET /app/update.json` and the file is `GET /app/GrokRemote-<version>.apk`, both behind `hub_token`. Publishing is `python tools/publish_update.py <apk> <channel>` into `data/app-updates/` (not committed). GitHub Releases are not used, because this repo is public.
+
+Build, keystore, install, and the exact ship steps: [android/README.md](android/README.md).
 
 ### Pull this build on the PC
 

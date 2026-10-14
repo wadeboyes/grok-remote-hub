@@ -26,6 +26,8 @@ import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.Button
@@ -47,15 +49,20 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.wadeboyes.grokremote.AppUpdater
 import com.wadeboyes.grokremote.BuildItem
 import com.wadeboyes.grokremote.HubClient
 import com.wadeboyes.grokremote.HubSettings
 import com.wadeboyes.grokremote.SettingsStore
+import com.wadeboyes.grokremote.UpdatePhase
+import com.wadeboyes.grokremote.UpdateUi
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -71,6 +78,9 @@ private data class ChatTarget(
 @Composable
 fun GrokApp(store: SettingsStore, client: HubClient) {
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+    val updater = remember { AppUpdater(context.applicationContext, client) }
+    var updateUi by remember { mutableStateOf(updater.state.value) }
     var settings by remember { mutableStateOf(store.read()) }
     var items by remember { mutableStateOf<List<BuildItem>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
@@ -108,8 +118,21 @@ fun GrokApp(store: SettingsStore, client: HubClient) {
         }
     }
 
+    LaunchedEffect(updater) {
+        updater.state.collect { updateUi = it }
+    }
+
     LaunchedEffect(settings.hubUrl, settings.token) {
         load(scheduleRefresh = false)
+        while (true) {
+            updater.checkAndInstall(settings.hubUrl, settings.token)
+            delay(AppUpdater.CHECK_EVERY_MS)
+        }
+    }
+
+    LaunchedEffect(updateUi.confirmSerial) {
+        val intent = updateUi.confirmIntent ?: return@LaunchedEffect
+        runCatching { context.startActivity(intent) }
     }
 
     fun resume(item: BuildItem) {
@@ -166,7 +189,11 @@ fun GrokApp(store: SettingsStore, client: HubClient) {
                 BackHandler { showSettings = false }
                 SettingsPane(
                     settings = settings,
+                    updateUi = updateUi,
                     onBack = { showSettings = false },
+                    onCheck = {
+                        scope.launch { updater.checkAndInstall(settings.hubUrl, settings.token) }
+                    },
                     onSave = { next ->
                         store.write(next)
                         settings = store.read()
@@ -197,6 +224,7 @@ fun GrokApp(store: SettingsStore, client: HubClient) {
                             onRefresh = { load(true) },
                             onSettings = { showSettings = true },
                             twoPane = true,
+                            updateBanner = if (updateUi.announce) updateUi.message else null,
                         )
                     }
                     Box(
@@ -213,7 +241,11 @@ fun GrokApp(store: SettingsStore, client: HubClient) {
                         when {
                             showSettings -> SettingsPane(
                                 settings = settings,
+                                updateUi = updateUi,
                                 onBack = { showSettings = false },
+                                onCheck = {
+                                    scope.launch { updater.checkAndInstall(settings.hubUrl, settings.token) }
+                                },
                                 onSave = { next ->
                                     store.write(next)
                                     settings = store.read()
@@ -254,6 +286,7 @@ fun GrokApp(store: SettingsStore, client: HubClient) {
                     onRefresh = { load(true) },
                     onSettings = { showSettings = true },
                     twoPane = false,
+                    updateBanner = if (updateUi.announce) updateUi.message else null,
                 )
             }
         }
@@ -293,6 +326,7 @@ private fun ListPane(
     onRefresh: () -> Unit,
     onSettings: () -> Unit,
     twoPane: Boolean,
+    updateBanner: String?,
 ) {
     Column(Modifier.fillMaxSize()) {
         Row(
@@ -319,6 +353,14 @@ private fun ListPane(
         }
         SearchField(query, onQuery, Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
         FilterRow(filter, onFilter, Modifier.padding(horizontal = 16.dp))
+        if (!updateBanner.isNullOrBlank()) {
+            Text(
+                updateBanner,
+                color = TextMain,
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+            )
+        }
         if (!error.isNullOrBlank()) {
             Text(
                 error,
@@ -551,7 +593,9 @@ private fun ChatPane(target: ChatTarget, onBack: () -> Unit, showBack: Boolean) 
 @Composable
 private fun SettingsPane(
     settings: HubSettings,
+    updateUi: UpdateUi,
     onBack: () -> Unit,
+    onCheck: () -> Unit,
     onSave: (HubSettings) -> Unit,
 ) {
     var url by rememberSaveable(settings.hubUrl) { mutableStateOf(settings.hubUrl) }
@@ -560,6 +604,7 @@ private fun SettingsPane(
     Column(
         Modifier
             .fillMaxSize()
+            .verticalScroll(rememberScrollState())
             .padding(16.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -602,8 +647,41 @@ private fun SettingsPane(
             colors = ButtonDefaults.buttonColors(containerColor = Accent, contentColor = AccentText),
         ) { Text("Save") }
         Spacer(Modifier.height(18.dp))
+        Text("Current version", style = MaterialTheme.typography.bodySmall)
         Text(
-            "Version 1.0.0. Made for the Galaxy S24 Ultra and the Galaxy Tab S10. Rotate the tablet for the two pane layout.",
+            "${updateUi.currentName} (${updateUi.currentCode})",
+            style = MaterialTheme.typography.bodyLarge,
+        )
+        Spacer(Modifier.height(10.dp))
+        Text("Available", style = MaterialTheme.typography.bodySmall)
+        Text(
+            if (updateUi.availableCode > 0L) {
+                "${updateUi.availableName} (${updateUi.availableCode})"
+            } else {
+                "None yet"
+            },
+            style = MaterialTheme.typography.bodyLarge,
+        )
+        Spacer(Modifier.height(12.dp))
+        val updateBusy = updateUi.phase == UpdatePhase.Checking ||
+            updateUi.phase == UpdatePhase.Downloading ||
+            updateUi.phase == UpdatePhase.Verifying ||
+            updateUi.phase == UpdatePhase.Installing
+        Button(
+            onClick = onCheck,
+            enabled = !updateBusy,
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = MinTouch),
+            colors = ButtonDefaults.buttonColors(containerColor = Accent, contentColor = AccentText),
+        ) { Text("Check for updates") }
+        if (updateUi.message.isNotBlank()) {
+            Spacer(Modifier.height(10.dp))
+            Text(updateUi.message, style = MaterialTheme.typography.bodyMedium)
+        }
+        Spacer(Modifier.height(14.dp))
+        Text(
+            "Made for the Galaxy S24 Ultra and the Galaxy Tab S10. Rotate the tablet for the two pane layout.",
             style = MaterialTheme.typography.bodySmall,
         )
     }
