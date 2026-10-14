@@ -14,6 +14,7 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -27,6 +28,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.width
@@ -36,11 +38,17 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Snackbar
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -63,6 +71,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.wadeboyes.grokremote.AppUpdater
 import com.wadeboyes.grokremote.BuildItem
 import com.wadeboyes.grokremote.HubClient
+import com.wadeboyes.grokremote.HubException
 import com.wadeboyes.grokremote.HubSettings
 import com.wadeboyes.grokremote.SettingsStore
 import com.wadeboyes.grokremote.UpdatePhase
@@ -81,6 +90,12 @@ private data class ChatTarget(
     val notice: String,
 )
 
+private data class RemovePrompt(
+    val item: BuildItem,
+    val danger: Boolean,
+    val message: String,
+)
+
 @Composable
 fun GrokApp(store: SettingsStore, client: HubClient) {
     val scope = rememberCoroutineScope()
@@ -97,6 +112,8 @@ fun GrokApp(store: SettingsStore, client: HubClient) {
     var showSettings by rememberSaveable { mutableStateOf(false) }
     var chat by remember { mutableStateOf<ChatTarget?>(null) }
     var busyKey by remember { mutableStateOf<String?>(null) }
+    var removePrompt by remember { mutableStateOf<RemovePrompt?>(null) }
+    val snackbarHostState = remember { SnackbarHostState() }
 
     fun load(scheduleRefresh: Boolean) {
         scope.launch {
@@ -169,9 +186,127 @@ fun GrokApp(store: SettingsStore, client: HubClient) {
         }
     }
 
+    fun restore(item: BuildItem) {
+        scope.launch {
+            val current = settings
+            val result = withContext(Dispatchers.IO) {
+                runCatching { client.restore(current.hubUrl, current.token, item) }
+            }
+            result.onSuccess {
+                items = items.map { row ->
+                    if (row.key == item.key) row.copy(archived = false) else row
+                }
+            }.onFailure { exc ->
+                error = exc.message ?: "Could not restore that item."
+            }
+        }
+    }
+
+    fun archive(item: BuildItem) {
+        if (busyKey != null) return
+        busyKey = item.key
+        scope.launch {
+            val current = settings
+            val result = withContext(Dispatchers.IO) {
+                runCatching { client.archive(current.hubUrl, current.token, item) }
+            }
+            busyKey = null
+            result.onSuccess {
+                val next = items.map { row ->
+                    if (row.key == item.key) row.copy(archived = true) else row
+                }
+                items = next
+                if (selectedKey == item.key && filter != "archived") {
+                    val stillVisible = filterItems(next, query, filter)
+                    if (stillVisible.none { it.key == selectedKey }) {
+                        selectedKey = stillVisible.firstOrNull()?.key
+                    }
+                }
+                val outcome = snackbarHostState.showSnackbar(
+                    message = "Archived ${item.title.ifBlank { "item" }}",
+                    actionLabel = "Undo",
+                    duration = SnackbarDuration.Short,
+                )
+                if (outcome == SnackbarResult.ActionPerformed) {
+                    restore(item)
+                }
+            }.onFailure { exc ->
+                error = exc.message ?: "Could not archive that item."
+            }
+        }
+    }
+
+    fun askRemove(item: BuildItem) {
+        if (item.kind != "worktree" || busyKey != null) return
+        removePrompt = RemovePrompt(
+            item = item,
+            danger = false,
+            message = removeConfirmText(item),
+        )
+    }
+
+    fun confirmRemove() {
+        val prompt = removePrompt ?: return
+        removePrompt = null
+        busyKey = prompt.item.key
+        scope.launch {
+            val current = settings
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    client.removeWorktree(current.hubUrl, current.token, prompt.item, prompt.danger)
+                }
+            }
+            busyKey = null
+            result.onSuccess { archivedSession ->
+                val next = items.mapNotNull { row ->
+                    when {
+                        row.key == prompt.item.key -> null
+                        archivedSession.isNotBlank() &&
+                            row.kind == "session" &&
+                            row.sessionId == archivedSession -> row.copy(archived = true)
+                        else -> row
+                    }
+                }
+                items = next
+                if (selectedKey == prompt.item.key) {
+                    selectedKey = filterItems(next, query, filter).firstOrNull()?.key
+                }
+                val folder = folderLabel(prompt.item)
+                snackbarHostState.showSnackbar(
+                    message = "Removed $folder.",
+                    duration = SnackbarDuration.Short,
+                )
+            }.onFailure { exc ->
+                val code = (exc as? HubException)?.code.orEmpty()
+                if (!prompt.danger && code in setOf("dirty", "unpushed", "dirty_unpushed")) {
+                    removePrompt = RemovePrompt(
+                        item = prompt.item,
+                        danger = true,
+                        message = removeAnywayText(exc.message ?: ""),
+                    )
+                } else {
+                    if (code == "missing") {
+                        items = items.filterNot { it.key == prompt.item.key }
+                    }
+                    error = exc.message ?: "Could not remove that worktree."
+                }
+            }
+        }
+    }
+
     Scaffold(
         containerColor = Bg,
         contentWindowInsets = WindowInsets.safeDrawing,
+        snackbarHost = {
+            SnackbarHost(snackbarHostState) { data ->
+                Snackbar(
+                    snackbarData = data,
+                    containerColor = Surface2,
+                    contentColor = TextMain,
+                    actionColor = Accent,
+                )
+            }
+        },
     ) { padding ->
         BoxWithConstraints(
             Modifier
@@ -182,7 +317,9 @@ fun GrokApp(store: SettingsStore, client: HubClient) {
             val twoPane = maxWidth >= TwoPaneMin
             val visible = remember(items, query, filter) { filterItems(items, query, filter) }
             val selected = visible.firstOrNull { it.key == selectedKey }
-                ?: items.firstOrNull { it.key == selectedKey }
+                ?: items.firstOrNull { it.key == selectedKey }?.takeIf { candidate ->
+                    filterItems(listOf(candidate), "", filter).isNotEmpty()
+                }
 
             if (!twoPane && chat != null) {
                 BackHandler { chat = null }
@@ -227,6 +364,9 @@ fun GrokApp(store: SettingsStore, client: HubClient) {
                             onFilter = { filter = it },
                             onSelect = { selectedKey = it.key },
                             onResume = { resume(it) },
+                            onArchive = { archive(it) },
+                            onRestore = { restore(it) },
+                            onRemove = { askRemove(it) },
                             onRefresh = { load(true) },
                             onSettings = { showSettings = true },
                             twoPane = true,
@@ -271,6 +411,9 @@ fun GrokApp(store: SettingsStore, client: HubClient) {
                                 item = selected,
                                 busy = busyKey == selected.key,
                                 onResume = { resume(selected) },
+                                onArchive = { archive(selected) },
+                                onRestore = { restore(selected) },
+                                onRemove = { askRemove(selected) },
                             )
                             else -> EmptyDetail()
                         }
@@ -289,12 +432,47 @@ fun GrokApp(store: SettingsStore, client: HubClient) {
                     onFilter = { filter = it },
                     onSelect = { selectedKey = it.key },
                     onResume = { resume(it) },
+                    onArchive = { archive(it) },
+                    onRestore = { restore(it) },
+                    onRemove = { askRemove(it) },
                     onRefresh = { load(true) },
                     onSettings = { showSettings = true },
                     twoPane = false,
                     updateBanner = if (updateUi.announce) updateUi.message else null,
                 )
             }
+        }
+        val prompt = removePrompt
+        if (prompt != null) {
+            BackHandler { removePrompt = null }
+            AlertDialog(
+                onDismissRequest = { removePrompt = null },
+                containerColor = Surface,
+                titleContentColor = TextMain,
+                textContentColor = TextMain,
+                title = {
+                    Text(if (prompt.danger) "Remove anyway" else "Remove worktree")
+                },
+                text = { Text(prompt.message) },
+                confirmButton = {
+                    Button(
+                        onClick = { confirmRemove() },
+                        modifier = Modifier.heightIn(min = MinTouch),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Danger,
+                            contentColor = TextMain,
+                        ),
+                    ) {
+                        Text(if (prompt.danger) "Remove anyway" else "Remove")
+                    }
+                },
+                dismissButton = {
+                    TextButton(
+                        onClick = { removePrompt = null },
+                        modifier = Modifier.heightIn(min = MinTouch),
+                    ) { Text("Cancel") }
+                },
+            )
         }
     }
 }
@@ -303,9 +481,10 @@ private fun filterItems(items: List<BuildItem>, query: String, filter: String): 
     val q = query.trim().lowercase()
     return items.filter { item ->
         val kindOk = when (filter) {
-            "session" -> item.kind == "session"
-            "worktree" -> item.kind == "worktree"
-            else -> true
+            "archived" -> item.archived
+            "session" -> item.kind == "session" && !item.archived
+            "worktree" -> item.kind == "worktree" && !item.archived
+            else -> !item.archived
         }
         if (!kindOk) return@filter false
         if (q.isEmpty()) return@filter true
@@ -329,6 +508,9 @@ private fun ListPane(
     onFilter: (String) -> Unit,
     onSelect: (BuildItem) -> Unit,
     onResume: (BuildItem) -> Unit,
+    onArchive: (BuildItem) -> Unit,
+    onRestore: (BuildItem) -> Unit,
+    onRemove: (BuildItem) -> Unit,
     onRefresh: () -> Unit,
     onSettings: () -> Unit,
     twoPane: Boolean,
@@ -401,7 +583,11 @@ private fun ListPane(
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
-                    "No sessions or worktrees match. Start work on the PC, then tap Refresh.",
+                    if (filter == "archived") {
+                        "Nothing is archived."
+                    } else {
+                        "No sessions or worktrees match. Start work on the PC, then tap Refresh."
+                    },
                     style = MaterialTheme.typography.bodyLarge,
                 )
             }
@@ -417,6 +603,9 @@ private fun ListPane(
                         busy = item.key == busyKey,
                         onSelect = { onSelect(item) },
                         onResume = { onResume(item) },
+                        onArchive = { onArchive(item) },
+                        onRestore = { onRestore(item) },
+                        onRemove = { onRemove(item) },
                     )
                 }
             }
@@ -431,6 +620,9 @@ private fun SessionCard(
     busy: Boolean,
     onSelect: () -> Unit,
     onResume: () -> Unit,
+    onArchive: () -> Unit,
+    onRestore: () -> Unit,
+    onRemove: () -> Unit,
 ) {
     val borderColor = if (selected) Accent else Border
     Column(
@@ -475,6 +667,29 @@ private fun SessionCard(
             Text("Updating this summary on the PC.", style = MaterialTheme.typography.bodySmall)
         }
         Spacer(Modifier.height(12.dp))
+        ItemActions(item, busy, onResume, onArchive, onRestore, onRemove)
+    }
+}
+
+@Composable
+private fun ItemActions(
+    item: BuildItem,
+    busy: Boolean,
+    onResume: () -> Unit,
+    onArchive: () -> Unit,
+    onRestore: () -> Unit,
+    onRemove: () -> Unit,
+) {
+    if (item.archived) {
+        Button(
+            onClick = onRestore,
+            enabled = !busy,
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = MinTouch),
+            colors = ButtonDefaults.buttonColors(containerColor = Accent, contentColor = AccentText),
+        ) { Text(if (busy) "Working..." else "Restore") }
+    } else {
         Button(
             onClick = onResume,
             enabled = !busy,
@@ -486,10 +701,56 @@ private fun SessionCard(
             Text(if (busy) "Working..." else item.buttonLabel)
         }
     }
+    val secondary = item.kind == "worktree" || !item.archived
+    if (!secondary) return
+    Spacer(Modifier.height(8.dp))
+    if (item.archived) {
+        if (item.kind == "worktree") {
+            TextButton(
+                onClick = onRemove,
+                enabled = !busy,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = MinTouch),
+            ) { Text("Remove", color = Danger) }
+        }
+    } else if (item.kind == "worktree") {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextButton(
+                onClick = onArchive,
+                enabled = !busy,
+                modifier = Modifier
+                    .weight(1f)
+                    .heightIn(min = MinTouch),
+            ) { Text("Archive") }
+            TextButton(
+                onClick = onRemove,
+                enabled = !busy,
+                modifier = Modifier
+                    .weight(1f)
+                    .heightIn(min = MinTouch),
+            ) { Text("Remove", color = Danger) }
+        }
+    } else {
+        TextButton(
+            onClick = onArchive,
+            enabled = !busy,
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = MinTouch),
+        ) { Text("Archive") }
+    }
 }
 
 @Composable
-private fun SummaryPane(item: BuildItem, busy: Boolean, onResume: () -> Unit) {
+private fun SummaryPane(
+    item: BuildItem,
+    busy: Boolean,
+    onResume: () -> Unit,
+    onArchive: () -> Unit,
+    onRestore: () -> Unit,
+    onRemove: () -> Unit,
+) {
     Column(
         Modifier
             .fillMaxSize()
@@ -499,6 +760,10 @@ private fun SummaryPane(item: BuildItem, busy: Boolean, onResume: () -> Unit) {
         Spacer(Modifier.height(6.dp))
         Text(item.title, style = MaterialTheme.typography.headlineSmall)
         Text(item.cwd, style = MaterialTheme.typography.bodySmall)
+        val branch = branchLabel(item.gitRef)
+        if (item.kind == "worktree" && branch.isNotBlank()) {
+            Text("Branch $branch", style = MaterialTheme.typography.bodySmall)
+        }
         Spacer(Modifier.height(16.dp))
         SummaryBlock("What it is", item.summary.what)
         SummaryBlock("What was being built", item.summary.built)
@@ -509,16 +774,7 @@ private fun SummaryPane(item: BuildItem, busy: Boolean, onResume: () -> Unit) {
             Spacer(Modifier.height(8.dp))
         }
         Spacer(Modifier.weight(1f))
-        Button(
-            onClick = onResume,
-            enabled = !busy,
-            modifier = Modifier
-                .fillMaxWidth()
-                .heightIn(min = MinTouch),
-            colors = ButtonDefaults.buttonColors(containerColor = Accent, contentColor = AccentText),
-        ) {
-            Text(if (busy) "Working..." else item.buttonLabel)
-        }
+        ItemActions(item, busy, onResume, onArchive, onRestore, onRemove)
     }
 }
 
@@ -833,10 +1089,17 @@ private fun SearchField(value: String, onValue: (String) -> Unit, modifier: Modi
 
 @Composable
 private fun FilterRow(filter: String, onFilter: (String) -> Unit, modifier: Modifier = Modifier) {
-    Row(modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        FilterChip("All", filter == "all", { onFilter("all") }, Modifier.weight(1f))
-        FilterChip("Sessions", filter == "session", { onFilter("session") }, Modifier.weight(1f))
-        FilterChip("Worktrees", filter == "worktree", { onFilter("worktree") }, Modifier.weight(1f))
+    Row(
+        modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        val chip = Modifier.widthIn(min = 96.dp)
+        FilterChip("All", filter == "all", { onFilter("all") }, chip)
+        FilterChip("Sessions", filter == "session", { onFilter("session") }, chip)
+        FilterChip("Worktrees", filter == "worktree", { onFilter("worktree") }, chip)
+        FilterChip("Archived", filter == "archived", { onFilter("archived") }, chip)
     }
 }
 
@@ -849,7 +1112,8 @@ private fun FilterChip(label: String, active: Boolean, onClick: () -> Unit, modi
             .heightIn(min = MinTouch)
             .clip(FieldShape)
             .background(bg)
-            .clickable(onClick = onClick),
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp),
         contentAlignment = Alignment.Center,
     ) {
         Text(label, color = fg, style = MaterialTheme.typography.labelLarge, maxLines = 1)
@@ -863,6 +1127,33 @@ private fun kindLabel(item: BuildItem): String {
         item.isSubagent -> "Subagent"
         else -> "Session"
     }
+}
+
+private fun branchLabel(gitRef: String): String {
+    val raw = gitRef.trim()
+    return if (raw.startsWith("refs/heads/")) raw.removePrefix("refs/heads/") else raw
+}
+
+private fun folderLabel(item: BuildItem): String {
+    return leaf(item.worktreePath.ifBlank { item.cwd }).ifBlank { item.title.ifBlank { "worktree" } }
+}
+
+private fun removeConfirmText(item: BuildItem): String {
+    val folder = folderLabel(item)
+    val branch = branchLabel(item.gitRef)
+    val named = if (branch.isNotBlank()) {
+        "Remove the worktree folder $folder on branch $branch?"
+    } else {
+        "Remove the worktree folder $folder?"
+    }
+    return "$named This can't be undone. The branch is kept."
+}
+
+private fun removeAnywayText(reason: String): String {
+    val clean = reason.trim().ifBlank {
+        "This worktree has uncommitted changes or unpushed commits."
+    }
+    return "$clean Remove anyway deletes the folder. This can't be undone. The branch is kept."
 }
 
 private fun leaf(path: String): String {

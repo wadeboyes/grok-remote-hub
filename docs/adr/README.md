@@ -47,3 +47,4 @@ a new ADR.
 | 020 | Process-local ops metrics and unified diagnostics | Accepted | 2026-07-26 |
 | 021 | Phone build index, stored summaries, hub resume | Accepted | 2026-10-14 |
 | 022 | Serve sideload app updates from the hub | Accepted | 2026-10-14 |
+| 023 | Archive list state on the hub, remove only linked worktrees | Accepted | 2026-10-14 |

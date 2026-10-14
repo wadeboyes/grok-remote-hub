@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
+from hub.archive import ArchiveStore, annotate_items
 from hub.build_summaries import (
     SUMMARY_SCRATCH_MARK,
     SummaryStore,
@@ -430,9 +431,11 @@ def build_catalog(
     store: SummaryStore,
     *,
     limit: int = DEFAULT_INDEX_LIMIT,
+    archive: ArchiveStore | None = None,
 ) -> dict[str, Any]:
     """Index plus stored summaries. Writes a quick summary when none is stored."""
     items = build_items(sessions_root, grok_home, limit=limit)
+    items = annotate_items(items, archive)
     due = attach_stored_summaries(items, store, quick_summary=_quick_summary_for_item)
     # Drop internal path from the wire payload? The phone does not need the
     # session directory. Keep cwd. Remove path after summaries are attached.

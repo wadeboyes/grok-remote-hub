@@ -97,6 +97,7 @@ from hub.session_policy import (
 from hub.session_tailer import EventDedupe, SessionTailer
 from hub.skills_index import list_skills
 from hub.version_info import HUB_VERSION, get_cli_version, structural_compat
+from hub.archive import ArchiveError, ArchiveStore, archive_catalog_item, restore_catalog_item
 from hub.build_actions import BuildActionError, execute_build_action
 from hub.build_index import (
     DEFAULT_INDEX_LIMIT,
@@ -105,6 +106,7 @@ from hub.build_index import (
     grok_home_from_sessions,
 )
 from hub.build_summaries import SummaryStore, item_key, refresh_item_summary
+from hub.worktree_remove import WorktreeRemoveError, parse_force, remove_catalog_worktree
 from hub.app_update import (
     UpdateManifestError,
     read_manifest,
@@ -269,6 +271,7 @@ class Hub:
         # While active, notification path skips terminal/started compact broadcasts.
         self._hub_compact_gate: dict[str, float] = {}
         self.summary_store = SummaryStore(PROJECT_ROOT / "data" / "build_summaries.json")
+        self.archive_store = ArchiveStore(PROJECT_ROOT / "data" / "archive.json")
         self._summary_task: asyncio.Task | None = None
         self._summary_force: set[str] = set()
         self.cli_version: str | None = None
@@ -1663,6 +1666,9 @@ class Hub:
         app.router.add_get("/api/build/index", self.handle_build_index)
         app.router.add_post("/api/build/summaries/refresh", self.handle_build_summaries_refresh)
         app.router.add_post("/api/build/resume", self.handle_build_resume)
+        app.router.add_post("/api/build/archive", self.handle_build_archive)
+        app.router.add_post("/api/build/restore", self.handle_build_restore)
+        app.router.add_post("/api/build/worktree/remove", self.handle_build_worktree_remove)
         app.router.add_get("/api/sessions/{id}/history", self.handle_history)
         app.router.add_get("/api/sessions/{id}/plan", self.handle_session_plan)
         app.router.add_post("/api/sessions/{id}/plan/action", self.handle_session_plan_action)
@@ -2540,6 +2546,7 @@ class Hub:
             self._grok_home(),
             self.summary_store,
             limit=limit,
+            archive=self.archive_store,
         )
         due = catalog.get("due") or []
         items = catalog.get("items") or []
@@ -2598,6 +2605,95 @@ class Hub:
         except Exception as exc:
             log.exception("build resume failed")
             return web.json_response({"error": str(exc)}, status=500)
+        return web.json_response(payload)
+
+    async def _read_object(self, request: web.Request) -> tuple[dict[str, Any] | None, web.Response | None]:
+        try:
+            body = await request.json()
+        except Exception:
+            return None, web.json_response({"error": "invalid json"}, status=400)
+        if not isinstance(body, dict):
+            return None, web.json_response({"error": "invalid json"}, status=400)
+        return body, None
+
+    async def _catalog_item(
+        self, kind: str, item_id: str
+    ) -> tuple[dict[str, Any] | None, web.Response | None]:
+        if not item_id:
+            return None, web.json_response({"error": "id required"}, status=400)
+        item = await asyncio.to_thread(
+            find_catalog_item,
+            self.config.sessions_root,
+            self._grok_home(),
+            kind=kind,
+            item_id=item_id,
+        )
+        if not item:
+            return None, web.json_response({"error": "session or worktree not found"}, status=404)
+        return item, None
+
+    async def handle_build_archive(self, request: web.Request) -> web.Response:
+        """Hide a session or worktree from the main lists. Does not touch session files."""
+        body, err = await self._read_object(request)
+        if err is not None or body is None:
+            return err or web.json_response({"error": "invalid json"}, status=400)
+        kind = str(body.get("kind") or "").strip().lower()
+        item_id = str(body.get("id") or "").strip()
+        if kind not in {"session", "worktree"}:
+            return web.json_response({"error": "kind must be session or worktree"}, status=400)
+        item, missing = await self._catalog_item(kind, item_id)
+        if missing is not None or item is None:
+            return missing or web.json_response({"error": "session or worktree not found"}, status=404)
+        try:
+            payload = archive_catalog_item(self.archive_store, item)
+        except ArchiveError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        return web.json_response(payload)
+
+    async def handle_build_restore(self, request: web.Request) -> web.Response:
+        """Put an archived session or worktree back on the main lists."""
+        body, err = await self._read_object(request)
+        if err is not None or body is None:
+            return err or web.json_response({"error": "invalid json"}, status=400)
+        kind = str(body.get("kind") or "").strip().lower()
+        item_id = str(body.get("id") or "").strip()
+        if kind not in {"session", "worktree"}:
+            return web.json_response({"error": "kind must be session or worktree"}, status=400)
+        item, missing = await self._catalog_item(kind, item_id)
+        if missing is not None or item is None:
+            return missing or web.json_response({"error": "session or worktree not found"}, status=404)
+        try:
+            payload = restore_catalog_item(self.archive_store, item)
+        except ArchiveError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        return web.json_response(payload)
+
+    async def handle_build_worktree_remove(self, request: web.Request) -> web.Response:
+        """git worktree remove from the parent repo. No --force unless force is true."""
+        body, err = await self._read_object(request)
+        if err is not None or body is None:
+            return err or web.json_response({"error": "invalid json"}, status=400)
+        item_id = str(body.get("id") or "").strip()
+        try:
+            force = parse_force(body.get("force", False))
+        except WorktreeRemoveError as exc:
+            return web.json_response({"error": exc.message, "code": exc.code}, status=exc.status)
+        item, missing = await self._catalog_item("worktree", item_id)
+        if missing is not None or item is None:
+            return missing or web.json_response({"error": "session or worktree not found"}, status=404)
+        try:
+            payload = await asyncio.to_thread(
+                remove_catalog_worktree,
+                item,
+                self._grok_home(),
+                self.archive_store,
+                force=force,
+            )
+        except WorktreeRemoveError as exc:
+            return web.json_response(
+                {"error": exc.message, "code": exc.code},
+                status=exc.status,
+            )
         return web.json_response(payload)
 
     async def _summary_refresh_loop(self) -> None:

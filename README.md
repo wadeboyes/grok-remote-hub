@@ -209,9 +209,16 @@ One tap on **Resume** calls `POST /api/build/resume`. The hub uses `grok.exe --c
 
 | Route | Role |
 |---|---|
-| `GET /api/build/index` | Sessions, worktrees, stored summaries |
+| `GET /api/build/index` | Sessions, worktrees, stored summaries, archive flags |
 | `POST /api/build/summaries/refresh` | Schedule a summary refresh |
 | `POST /api/build/resume` | Resume or restart, return `chatPath` |
+| `POST /api/build/archive` | Hide a session or worktree from the main lists |
+| `POST /api/build/restore` | Show an archived session or worktree again |
+| `POST /api/build/worktree/remove` | `git worktree remove` for one worktree under `~/.grok/worktrees` |
+
+**Archive** hides a card from All, Sessions, and Worktrees and puts it on Archived, with Restore. The hub stores that in `data/archive.json` (session id or worktree path) so both devices match. It does not change `~/.grok/sessions`. The app shows an undo snackbar after archive.
+
+**Remove** is worktrees only. The app asks first, naming the folder and branch, and says it can't be undone. The hub runs `git worktree remove` in the parent repo and does not delete the branch. If the worktree has uncommitted changes or unpushed commits, the hub refuses until a second **Remove anyway**, which passes `--force`. Anything outside `~/.grok/worktrees`, and the main checkout, is refused. Remove also archives that worktree's session.
 
 These routes use the same `hub_token` check as the rest of the hub. There is no guest mode. Auto approve on `grok agent serve` is unchanged.
 

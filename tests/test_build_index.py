@@ -562,6 +562,10 @@ def test_build_routes_stay_behind_hub_token() -> None:
     assert "/api/build" not in middleware
     assert server.count('add_get("/api/build/index"') == 1
     assert server.count('add_post("/api/build/resume"') == 1
+    assert server.count('add_post("/api/build/archive"') == 1
+    assert server.count('add_post("/api/build/restore"') == 1
+    assert server.count('add_post("/api/build/worktree/remove"') == 1
+    assert "handle_delete_session" not in server[server.find("def handle_build_archive") : server.find("def handle_build_worktree_remove") + 800]
     supervisor = Path("hub/agent_supervisor.py").read_text(encoding="utf-8")
     assert "--always-approve" in supervisor
 

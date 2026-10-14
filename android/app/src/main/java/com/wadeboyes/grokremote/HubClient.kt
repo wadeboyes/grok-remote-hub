@@ -9,7 +9,7 @@ import java.net.URL
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 
-class HubException(message: String) : Exception(message)
+class HubException(message: String, val code: String = "") : Exception(message)
 
 data class BuildSummary(
     val what: String,
@@ -34,6 +34,8 @@ data class BuildItem(
     val isSubagent: Boolean,
     val actionHint: String,
     val summary: BuildSummary,
+    val gitRef: String = "",
+    val archived: Boolean = false,
 ) {
     val key: String get() = "$kind:$id"
     val buttonLabel: String get() = if (actionHint == "restart") "Restart" else "Resume"
@@ -97,6 +99,28 @@ class HubClient {
             title = body.optString("title"),
             command = command,
         )
+    }
+
+    fun archive(baseUrl: String, token: String, item: BuildItem) {
+        val payload = JSONObject()
+            .put("kind", item.kind)
+            .put("id", item.id)
+        request("POST", baseUrl, "/api/build/archive", token, payload, 20000)
+    }
+
+    fun restore(baseUrl: String, token: String, item: BuildItem) {
+        val payload = JSONObject()
+            .put("kind", item.kind)
+            .put("id", item.id)
+        request("POST", baseUrl, "/api/build/restore", token, payload, 20000)
+    }
+
+    fun removeWorktree(baseUrl: String, token: String, item: BuildItem, force: Boolean): String {
+        val payload = JSONObject()
+            .put("id", item.id)
+            .put("force", force)
+        val body = request("POST", baseUrl, "/api/build/worktree/remove", token, payload, 120000)
+        return body.optString("archivedSessionId")
     }
 
     fun fetchUpdateManifest(baseUrl: String, token: String): UpdateManifest? {
@@ -204,6 +228,8 @@ class HubClient {
             status = row.optString("status"),
             isSubagent = row.optBoolean("isSubagent"),
             actionHint = row.optString("actionHint", "resume"),
+            gitRef = row.optString("gitRef"),
+            archived = row.optBoolean("archived"),
             summary = BuildSummary(
                 what = summary.optString("what"),
                 built = summary.optString("built"),
@@ -229,9 +255,11 @@ class HubClient {
             throw HubException("The hub rejected the token. Open Settings and paste the hub token.")
         }
         if (raw.code !in 200..299) {
-            val err = runCatching { JSONObject(raw.text).optString("error") }.getOrDefault("")
+            val parsed = runCatching { JSONObject(raw.text) }.getOrNull()
+            val err = parsed?.optString("error").orEmpty()
+            val code = parsed?.optString("code").orEmpty()
             val detail = err.ifBlank { "Hub returned ${raw.code}." }
-            throw HubException(detail)
+            throw HubException(detail, code)
         }
         if (raw.text.isBlank()) return JSONObject()
         return JSONObject(raw.text)
