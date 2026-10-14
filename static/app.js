@@ -1189,10 +1189,29 @@
     }, ms);
   }
 
+  const ACP_BLIP_TEXT =
+    "Connection to Grok blipped, reconnected. Grok may still be working.";
+
+  /** True for the plain blip sentence or the raw websockets 1011 keepalive close. */
+  function isAcpBlip(msg) {
+    const text = String(msg || "");
+    if (text.indexOf(ACP_BLIP_TEXT) >= 0) return true;
+    return (
+      /keepalive ping timeout/i.test(text) || /1011 \(internal error\)/i.test(text)
+    );
+  }
+
+  function friendlyHubError(msg) {
+    const text = String(msg || "");
+    if (isAcpBlip(text)) return ACP_BLIP_TEXT;
+    return text;
+  }
+
   /** Recoverable turn-clear notices (stall / max duration / no output / auto-retry) — not hard failures. */
   function isRecoverableTurnClear(msg) {
-    return /send again|try again|turn cleared|stalled mid-turn|no activity|max duration|no output|recovering|retrying|still not responding/i.test(
-      String(msg || "")
+    const text = friendlyHubError(msg);
+    return /send again|try again|turn cleared|stalled mid-turn|no activity|max duration|no output|recovering|retrying|still not responding|blipped|reconnected/i.test(
+      text
     );
   }
 
@@ -7717,8 +7736,26 @@
       } else if (msg.state === "running") {
         setTurnRunning(true, sid);
         // Soft notice during same-session no-output auto-recovery (not a dead-end error).
-        if (msg.error && /recovering|retrying/i.test(String(msg.error))) {
-          reportInfo(msg.error, { sessionId: sid, source: "turn" });
+        const runNotice = friendlyHubError(msg.error);
+        if (
+          runNotice &&
+          (isAcpBlip(runNotice) || /recovering|retrying/i.test(runNotice))
+        ) {
+          reportInfo(runNotice, { sessionId: sid, source: "turn" });
+          if (isAcpBlip(runNotice)) {
+            const noteKey = `${sid || "_"}:${runNotice}`;
+            if (!state._turnClearNotes) state._turnClearNotes = {};
+            if (!state._turnClearNotes[noteKey]) {
+              state._turnClearNotes[noteKey] = true;
+              const appendBlipNote = () =>
+                appendMessage({ role: "system", text: runNotice });
+              if (!sid || sid === state.selectedId) {
+                appendBlipNote();
+              } else {
+                withSessionTarget(sid, appendBlipNote);
+              }
+            }
+          }
         }
       } else if (msg.state === "idle") {
         const anyLeft = (state.liveTurns || []).length > 0;
@@ -7777,18 +7814,19 @@
           }
         }
         if (msg.error) {
+          const shown = friendlyHubError(msg.error);
           if (recoverable) {
             // Resend offer already toasted for no-output; avoid double toast.
             if (!keepPending) {
-              reportInfo(msg.error, { sessionId: sid, source: "turn" });
+              reportInfo(shown, { sessionId: sid, source: "turn" });
             }
             // Once: also land the notice in the session transcript.
-            const noteKey = `${sid || "_"}:${msg.error}`;
+            const noteKey = `${sid || "_"}:${shown}`;
             if (!state._turnClearNotes) state._turnClearNotes = {};
             if (!state._turnClearNotes[noteKey]) {
               state._turnClearNotes[noteKey] = true;
               const appendClearNote = () =>
-                appendMessage({ role: "system", text: msg.error });
+                appendMessage({ role: "system", text: shown });
               if (!sid || sid === state.selectedId) {
                 appendClearNote();
               } else {
@@ -7796,7 +7834,7 @@
               }
             }
           } else {
-            reportError(msg.error, { sessionId: sid, source: "turn" });
+            reportError(shown, { sessionId: sid, source: "turn" });
           }
         }
         if (!sid || sid === state.selectedId) {
@@ -7812,10 +7850,11 @@
       return;
     }
     if (type === "error") {
-      const errText = msg.message || "Error";
+      const errText = friendlyHubError(msg.message || "Error");
       const queueFull = /queue full/i.test(errText);
       const busy = /busy|stuck/i.test(errText);
-      const recovering = /recovering|retrying/i.test(errText);
+      const recovering =
+        isAcpBlip(errText) || /recovering|retrying/i.test(errText);
       const soft = recovering || isRecoverableTurnClear(errText);
       // Queue-full / busy from old hub: keep turnRunning; do not unlock the turn.
       // Recovery in progress: keep turnRunning so composer stays in working state.

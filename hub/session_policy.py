@@ -17,6 +17,22 @@ NO_OUTPUT_RETRY_SECONDS = 90.0
 # No auto KillAgent/restart-agent solely from no-output prefill timeouts.
 # Operator restart remains via POST /api/admin/restart-agent (zombie/down).
 
+# Shown when the ACP socket drops on a keepalive ping while a prompt is in flight.
+# The hub reconnects and session/load so later output can still stream.
+ACP_BLIP_USER_MSG = (
+    "Connection to Grok blipped, reconnected. Grok may still be working."
+)
+
+
+def is_keepalive_ping_timeout(exc: BaseException | str | None) -> bool:
+    """True for the websockets 1011 keepalive close (busy agent, slow pong)."""
+    text = str(exc or "").lower()
+    if "keepalive ping timeout" in text:
+        return True
+    if "1011" in text and "ping timeout" in text:
+        return True
+    return False
+
 # Silence after activity — only for truly dead agents (tools can be quiet minutes).
 # Heavy sessions with slow mid-turn tools use this, not first-byte scaling.
 MID_TURN_STALL_SECONDS = 600.0  # 10 min

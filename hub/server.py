@@ -75,12 +75,14 @@ from hub.status_view import (
 from hub.acp_trace import session_id_slice
 from hub.session_signals import read_session_signals, read_signals_file, find_signals_path
 from hub.session_policy import (
+    ACP_BLIP_USER_MSG,
     HOT_PATH_MAX_HUB_PRE_PROMPT_S,
     NO_OUTPUT_RETRY_SECONDS,
     STUCK_TURN_SECONDS,
     bg_activity_label,
     cwd_key,
     is_hub_resume_candidate,
+    is_keepalive_ping_timeout,
     is_live_hot_path,
     is_no_output_error_message,
     is_permanent_session_load_failure,
@@ -627,14 +629,29 @@ class Hub:
         else:
             if self._acp_disconnected_at is None:
                 self._acp_disconnected_at = time.monotonic()
-            # Prior process-local session/new ids are dead after ACP drop.
-            # Keep remote_agent_session for UI badges; next ensure will session/new.
-            if self.acp_created_sessions:
+            # A keepalive blip keeps the in-flight ids so ensure does not
+            # session/new over a turn the agent is still running.
+            hold = {
+                str(sid)
+                for sid in (getattr(self.acp, "blip_hold_session_ids", set()) or set())
+                if str(sid)
+            }
+            if hold:
+                kept = {sid for sid in self.acp_created_sessions if sid in hold}
+                self.acp_created_sessions = kept | hold
                 log.info(
-                    "ACP disconnected; clearing %d agent-live session id(s)",
-                    len(self.acp_created_sessions),
+                    "ACP keepalive blip; keeping %d in-flight session id(s)",
+                    len(hold),
                 )
-            self.acp_created_sessions.clear()
+            else:
+                # Prior process-local session/new ids are dead after ACP drop.
+                # Keep remote_agent_session for UI badges; next ensure will session/new.
+                if self.acp_created_sessions:
+                    log.info(
+                        "ACP disconnected; clearing %d agent-live session id(s)",
+                        len(self.acp_created_sessions),
+                    )
+                self.acp_created_sessions.clear()
             sids = list(self.acp.disconnect_turn_session_ids or [])
             self.acp.disconnect_turn_session_ids = []
             sid = self.acp.disconnect_turn_session_id
@@ -642,8 +659,12 @@ class Hub:
             if sid and sid not in sids:
                 sids.append(sid)
             if not sids and self.acp.turn_session_id:
-                sids.append(self.acp.turn_session_id)
+                primary = self.acp.turn_session_id
+                if primary not in hold:
+                    sids.append(primary)
             for cleared in sids:
+                if cleared in hold:
+                    continue
                 await self.broadcast(
                     {
                         "type": "turn",
@@ -652,6 +673,16 @@ class Hub:
                         "error": "ACP disconnected",
                     },
                     session_id=cleared,
+                )
+            for kept_sid in hold:
+                await self.broadcast(
+                    {
+                        "type": "turn",
+                        "sessionId": kept_sid,
+                        "state": "running",
+                        "error": ACP_BLIP_USER_MSG,
+                    },
+                    session_id=kept_sid,
                 )
         await self.broadcast(self.status_payload())
 
@@ -4373,13 +4404,22 @@ class Hub:
                 )
             except Exception:
                 pass
-            if self.acp.is_session_active(session_id):
+            keepalive_blip = (
+                is_keepalive_ping_timeout(exc)
+                or ACP_BLIP_USER_MSG in str(exc)
+                or session_id in self.acp.blip_hold_session_ids
+            )
+            # Do not cancel the agent: a busy turn may still be running.
+            if self.acp.is_session_active(session_id) and not keepalive_blip:
                 await self.acp.end_turn(
                     session_id, f"prompt exception: {exc}"
                 )
 
             # Hang with zero output: heal + auto-retry once on same session.
-            if should_auto_retry_no_output(exc, already_retried=not _auto_retry):
+            if (
+                not keepalive_blip
+                and should_auto_retry_no_output(exc, already_retried=not _auto_retry)
+            ):
                 await self._no_output_auto_retry(
                     session_id=session_id,
                     view_session_id=view_session_id,
@@ -4389,7 +4429,9 @@ class Hub:
                 )
             else:
                 err_msg = str(exc)
-                if self._is_no_output_error(exc):
+                if keepalive_blip:
+                    err_msg = ACP_BLIP_USER_MSG
+                elif self._is_no_output_error(exc):
                     try:
                         self.ops.inc("prompt_no_output")
                         self.ops.emit(
@@ -4425,15 +4467,32 @@ class Hub:
                         self.acp.last_force_clear_reason
                     )
 
-                await self._broadcast_turn(
-                    session_id, "idle", err_msg, also_session_id=view_session_id
-                )
-                await self._emit_error(
-                    err_msg, session_id=session_id, level="warning"
-                )
+                still_active = self.acp.is_session_active(session_id)
+                if keepalive_blip and still_active:
+                    await self._broadcast_turn(
+                        session_id,
+                        "running",
+                        err_msg,
+                        also_session_id=view_session_id,
+                    )
+                else:
+                    await self._broadcast_turn(
+                        session_id,
+                        "idle",
+                        err_msg,
+                        also_session_id=view_session_id,
+                    )
+                    if not keepalive_blip:
+                        await self._emit_error(
+                            err_msg, session_id=session_id, level="warning"
+                        )
         finally:
-            # Always re-assert idle unlock path via status (success already idled above)
-            if self.acp.is_session_active(session_id):
+            # Always re-assert idle unlock path via status (success already idled above).
+            # A keepalive hold means the agent may still be working: do not cancel it.
+            if (
+                self.acp.is_session_active(session_id)
+                and session_id not in self.acp.blip_hold_session_ids
+            ):
                 await self.acp.end_turn(
                     session_id, "prompt finally safeguard"
                 )

@@ -33,6 +33,8 @@ from hub.session_policy import (
     notification_counts_as_turn_activity,
     notification_is_rich_activity,
     session_notification_kind,
+    ACP_BLIP_USER_MSG,
+    is_keepalive_ping_timeout,
     should_force_clear_turn,
     should_skip_session_load,
 )
@@ -49,6 +51,12 @@ from hub.status_view import (
 )
 
 log = logging.getLogger("hub.acp")
+
+# The websockets client default ping (20s / 20s) closes a busy grok agent with
+# "sent 1011 (internal error) keepalive ping timeout". Idle half-open sockets
+# are checked by maybe_probe_liveness, which does not run while a prompt is pending.
+ACP_WS_PING_INTERVAL = None
+ACP_WS_PING_TIMEOUT = None
 
 MessageCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 
@@ -162,6 +170,11 @@ class AcpClient:
         self.last_send_error_at: float | None = None
         self.consecutive_send_failures: int = 0
         self._force_unhealthy_scheduled: bool = False
+        # Keepalive ping timeout while a prompt is in flight. Do not zombie-clear.
+        self._disconnect_keepalive: bool = False
+        self.blip_hold_session_ids: set[str] = set()
+        # Hub broadcasts the plain blip notice. (session_id) -> None or awaitable.
+        self.on_keepalive_blip: Callable[[str], Awaitable[None] | None] | None = None
         # Proactive WS ping probe timestamps (monotonic).
         self.last_probe_at: float | None = None
         self.last_probe_ok_at: float | None = None
@@ -955,13 +968,24 @@ class AcpClient:
             raise
         except Exception as exc:
             log.debug("ACP recv loop ended: %s", exc)
-            # Fail pending requests so waiters unblock
+            self.note_socket_error(exc)
+            # Fail pending requests so waiters unblock. A keepalive blip keeps
+            # active_turns so session/prompt can session/load after reconnect.
+            blip = self._disconnect_keepalive and bool(self.blip_hold_session_ids)
+            err = (
+                ConnectionError(
+                    "ACP keepalive ping timeout; no close frame received"
+                )
+                if blip
+                else ConnectionError(f"ACP recv ended: {exc}")
+            )
             for fut in list(self._pending.values()):
                 if not fut.done():
-                    fut.set_exception(ConnectionError(f"ACP recv ended: {exc}"))
+                    fut.set_exception(err)
             self._pending.clear()
             self._pending_session.clear()
-            self._cancel_all_pending_user_questions()
+            if not blip:
+                self._cancel_all_pending_user_questions()
 
     async def _maintain(self) -> None:
         backoff = 1.0
@@ -974,11 +998,19 @@ class AcpClient:
                     host=self.config.agent_bind,
                     port=self.config.agent_port,
                 )
-                async with ws_connect(url, open_timeout=10, max_size=16 * 1024 * 1024) as ws:
+                async with ws_connect(
+                    url,
+                    open_timeout=10,
+                    max_size=16 * 1024 * 1024,
+                    ping_interval=ACP_WS_PING_INTERVAL,
+                    ping_timeout=ACP_WS_PING_TIMEOUT,
+                ) as ws:
                     self._ws = ws
                     # Reader must run before initialize/request awaits responses
                     self._recv_task = asyncio.create_task(self._recv_loop(ws), name="acp-recv")
                     await self._initialize()
+                    # New socket is up. Later send failures are real, not this blip.
+                    self._disconnect_keepalive = False
                     await self._set_connected(True)
                     backoff = 1.0
                     log.info("ACP connected and initialized")
@@ -1001,6 +1033,7 @@ class AcpClient:
                 log.info("ACP recv cancelled (reconnect); maintain continues")
             except Exception as exc:
                 log.warning("ACP connection error: %s", exc)
+                self.note_socket_error(exc)
                 self._trace("disconnect", reason="connection_error", error=str(exc)[:200])
             finally:
                 self._ws = None
@@ -1012,16 +1045,35 @@ class AcpClient:
                 self._load_inflight.clear()
                 # Cancel method may no longer apply after reconnect.
                 self._cancel_method = None
-                if (
+                preserve = self.should_preserve_turn_on_disconnect()
+                if preserve and self.active_turns:
+                    self.blip_hold_session_ids = set(self.active_turns.keys())
+                if preserve:
+                    # Unblock session/prompt so it can reattach. Do not clear
+                    # the turn and do not mark the socket zombie.
+                    for fut in list(self._pending.values()):
+                        if not fut.done():
+                            fut.set_exception(
+                                ConnectionError(
+                                    "ACP keepalive ping timeout; no close frame received"
+                                )
+                            )
+                    self._pending.clear()
+                    self._pending_session.clear()
+                elif (
                     self.active_turns
                     or self._pending
                     or self._pending_user_questions
                 ):
                     # WS already dead: cancel RPC cannot work; unlock locally.
                     self.force_clear_turn("acp disconnected")
+                    self._disconnect_keepalive = False
+                    self.blip_hold_session_ids = set()
                 else:
                     self.active_turns.clear()
                     self._cancel_all_stall_watchdogs()
+                    self._disconnect_keepalive = False
+                    self.blip_hold_session_ids = set()
                 if self._recv_task and not self._recv_task.done():
                     self._recv_task.cancel()
                     try:
@@ -1029,12 +1081,13 @@ class AcpClient:
                     except asyncio.CancelledError:
                         pass
                 self._recv_task = None
-                for fut in list(self._pending.values()):
-                    if not fut.done():
-                        fut.set_exception(ConnectionError("ACP connection closed"))
-                self._pending.clear()
-                self._pending_session.clear()
-                self._cancel_all_pending_user_questions()
+                if not preserve:
+                    for fut in list(self._pending.values()):
+                        if not fut.done():
+                            fut.set_exception(ConnectionError("ACP connection closed"))
+                    self._pending.clear()
+                    self._pending_session.clear()
+                    self._cancel_all_pending_user_questions()
                 if self.connected:
                     self._trace("disconnect", reason="ws_closed")
                     await self._set_connected(False)
@@ -1506,14 +1559,21 @@ class AcpClient:
         try:
             await ws.send(json.dumps(payload))
         except Exception as exc:
-            self.consecutive_send_failures += 1
-            self.last_send_error_at = time.monotonic()
+            blip = self._send_is_keepalive_blip(exc)
             self._trace(
                 "send_fail",
                 method=str(method)[:80] if method else None,
                 consecutive_failures=self.consecutive_send_failures,
                 error=str(exc)[:200],
+                keepalive_blip=blip,
             )
+            if blip:
+                # Busy agent missed a pong. Reconnect reattaches the prompt.
+                # Do not count this toward zombie / force_unhealthy.
+                self.note_socket_error(exc)
+                raise
+            self.consecutive_send_failures += 1
+            self.last_send_error_at = time.monotonic()
             if self.consecutive_send_failures >= 2:
                 self._schedule_force_unhealthy(reason="send_failures")
             raise
@@ -1591,7 +1651,83 @@ class AcpClient:
         self._warm_sessions.add(sid)
         return sid
 
-    async def session_load(self, session_id: str, cwd: str) -> Any:
+    def note_socket_error(self, exc: BaseException) -> None:
+        """Remember a keepalive ping timeout so a live prompt is not zombie-cleared."""
+        if not is_keepalive_ping_timeout(exc):
+            return
+        self._disconnect_keepalive = True
+        if self.active_turns:
+            self.blip_hold_session_ids = set(self.active_turns.keys())
+
+    def should_preserve_turn_on_disconnect(self) -> bool:
+        return bool(
+            self._disconnect_keepalive
+            and (self.active_turns or self.blip_hold_session_ids)
+        )
+
+    def _prompt_pending(self) -> bool:
+        return bool(self.active_turns or self._pending)
+
+    def _send_is_keepalive_blip(self, exc: BaseException) -> bool:
+        if not self._prompt_pending():
+            return False
+        return is_keepalive_ping_timeout(exc) or self._disconnect_keepalive
+
+    async def _wait_until_connected(self, timeout: float = 20.0) -> None:
+        deadline = time.monotonic() + max(0.5, float(timeout))
+        while time.monotonic() < deadline:
+            if self.connected and self._ws is not None:
+                return
+            await asyncio.sleep(0.05)
+        raise TimeoutError("ACP reconnect timed out after keepalive blip")
+
+    async def _await_reattached_turn(self, session_id: str) -> None:
+        """Wait until session/update says the reattached turn finished."""
+        meta = self.active_turns.get(session_id) or {}
+        started = meta.get("started_at")
+        start = float(started) if started is not None else time.monotonic()
+        deadline = start + float(MAX_TURN_SECONDS)
+        while session_id in self.active_turns:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("max turn duration")
+            await asyncio.sleep(0.05)
+
+    async def _notify_keepalive_blip(self, session_id: str) -> None:
+        cb = self.on_keepalive_blip
+        if cb is None:
+            return
+        try:
+            result = cb(session_id)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:
+            log.debug("keepalive blip notify failed", exc_info=True)
+
+    async def _reattach_after_keepalive(self, session_id: str, cwd: str | None) -> None:
+        """Reconnect is the maintain loop. Then session/load the same id."""
+        self._trace(
+            "prompt_blip",
+            sessionId=session_id_slice(session_id),
+            hold=len(self.blip_hold_session_ids),
+        )
+        await self._notify_keepalive_blip(session_id)
+        await self._wait_until_connected()
+        folder = str(cwd or "").strip()
+        if not folder:
+            raise RuntimeError("cwd required to reattach after keepalive blip")
+        self.forget_warm_session(session_id)
+        await self.session_load(session_id, folder, allow_during_turn=True)
+        self.blip_hold_session_ids.discard(session_id)
+        self._trace("reattach_ok", sessionId=session_id_slice(session_id))
+        await self._await_reattached_turn(session_id)
+
+    async def session_load(
+        self,
+        session_id: str,
+        cwd: str,
+        *,
+        allow_during_turn: bool = False,
+    ) -> Any:
         sid = str(session_id)
         # Already loaded in this process: skip agent session/load (not model prefill).
         if should_skip_session_load(self._warm_sessions, sid):
@@ -1607,7 +1743,8 @@ class AcpClient:
         self._load_inflight[sid] = fut
         try:
             # Only block load of this session if it is mid-turn (not other projects).
-            if session_id in self.active_turns:
+            # Reattach after a keepalive blip loads while that turn is still active.
+            if session_id in self.active_turns and not allow_during_turn:
                 if self.is_turn_stuck(session_id=session_id):
                     await self.end_turn(session_id, "stuck turn before session/load")
                 else:
@@ -1935,6 +2072,27 @@ class AcpClient:
             self._trace("prompt_end", sessionId=session_id_slice(session_id), ok=True)
             return result
         except Exception as exc:
+            blip = is_keepalive_ping_timeout(exc) or (
+                self._disconnect_keepalive and session_id in self.active_turns
+            )
+            if blip:
+                try:
+                    await self._reattach_after_keepalive(session_id, cwd)
+                    log.info("Prompt end session=%s ok after keepalive reattach", session_id)
+                    self._trace(
+                        "prompt_end",
+                        sessionId=session_id_slice(session_id),
+                        ok=True,
+                        via="reattach",
+                    )
+                    return {"reattached": True}
+                except Exception as recover_exc:
+                    log.warning(
+                        "Prompt reattach failed session=%s: %s",
+                        session_id,
+                        recover_exc,
+                    )
+                    exc = recover_exc
             log.warning("Prompt end session=%s error: %s", session_id, exc)
             self._trace(
                 "prompt_end",
@@ -1942,6 +2100,9 @@ class AcpClient:
                 ok=False,
                 error=str(exc)[:200],
             )
+            # Plain sentence for the UI. A real max-turn timeout stays as-is.
+            if blip and "max turn duration" not in str(exc).lower():
+                raise RuntimeError(ACP_BLIP_USER_MSG) from exc
             raise
         finally:
             self._clear_active_turn(session_id)
