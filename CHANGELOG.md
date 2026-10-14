@@ -10,7 +10,8 @@ This file is the **public narrative**. Session chat context is not required to u
 ## [Unreleased]
 
 ### Fixed
-- **Resume opens the chat.** A worktree card resumes the latest session in that folder and starts a fresh session only when none exists. The embedded page loads its scripts with the same `hub_token` (page URL, cookie, or Bearer) and opens that session instead of staying on Connecting with no session selected. App build 1.0.2 (versionCode 3).
+- **Embedded chat was a black pane.** Resume now keeps one websocket, and the embedded page always shows the transcript (or "No messages yet") plus a composer. The chat column is not clipped when the sidebar is hidden. App build 1.0.3 (versionCode 4). WebView console lines go to logcat as `GrokRemoteWeb`.
+- **Resume opens the chat.** A worktree card resumes the latest session in that folder and starts a fresh session only when none exists. The embedded page loads its scripts with the same `hub_token` (page URL, cookie, or Bearer) and opens that session instead of staying on Connecting with no session selected.
 - **Session titles and summaries** now read `chat_history.jsonl`, `prompt_history.jsonl`, and updates or events when those are the conversation. Untitled sessions with history get a short title from the first user request. Stored filler summaries are rebuilt, and a history change refreshes the list text. Headless summary sessions under `data/.grok-hub-summary` stay off the list.
 
 ### Added

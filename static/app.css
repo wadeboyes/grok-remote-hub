@@ -5175,7 +5175,25 @@ a {
   }
 }
 
-/* Android resume chat: native app owns the list, this view is the transcript. */
+/* Android resume chat: native app owns the list, this view is the transcript.
+   Do not use display:block or max-height:100dvh here. A zero dvh in the WebView
+   clips the whole pane to black, and a block app collapses the chat column. */
+html.embed-chat,
+html.embed-chat body {
+  height: 100%;
+  min-height: 100%;
+  background: var(--bg);
+  color: var(--text);
+}
+html.embed-chat #app {
+  display: flex !important;
+  flex-direction: row;
+  width: 100%;
+  height: 100% !important;
+  min-height: 100% !important;
+  max-height: none !important;
+  overflow: hidden;
+}
 html.embed-chat #rail,
 html.embed-chat #rail-backdrop,
 html.embed-chat #btn-menu,
@@ -5184,15 +5202,36 @@ html.embed-chat #btn-topbar-new,
 html.embed-chat #empty-main {
   display: none !important;
 }
+html.embed-chat .main {
+  flex: 1 1 auto;
+  width: auto;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+html.embed-chat .chat-panel,
+html.embed-chat .transcript-wrap {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+html.embed-chat .composer-shell,
 html.embed-chat #app.is-home .composer-shell,
 html.embed-chat #app.is-home .turn-strip {
   display: flex !important;
+  flex-shrink: 0;
+  visibility: visible !important;
 }
-html.embed-chat #app {
-  display: block;
-  min-height: 100dvh;
+html.embed-chat .composer,
+html.embed-chat #composer-form {
+  display: flex !important;
 }
-html.embed-chat .main {
-  min-height: 100dvh;
-  width: 100%;
+html.embed-chat #composer-input {
+  display: block !important;
+  min-height: 44px;
+  visibility: visible !important;
+  opacity: 1 !important;
 }

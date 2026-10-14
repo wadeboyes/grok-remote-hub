@@ -2,6 +2,9 @@ package com.wadeboyes.grokremote.ui
 
 import android.annotation.SuppressLint
 import android.net.Uri
+import android.util.Log
+import android.view.ViewGroup
+import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
 import android.webkit.WebSettings
@@ -540,19 +543,42 @@ private fun EmptyDetail() {
     }
 }
 
+private const val WEB_LOG = "GrokRemoteWeb"
+
 @SuppressLint("SetJavaScriptEnabled")
 private fun prepareChatWebView(webView: WebView) {
+    webView.layoutParams = ViewGroup.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT,
+        ViewGroup.LayoutParams.MATCH_PARENT,
+    )
+    webView.setBackgroundColor(0xFF0A0C10.toInt())
     val settings = webView.settings
     settings.javaScriptEnabled = true
     settings.domStorageEnabled = true
     settings.useWideViewPort = true
-    settings.loadWithOverviewMode = true
+    // Overview zoom shrinks the chat to a speck and leaves the pane black.
+    settings.loadWithOverviewMode = false
     // A cached 401 for app.js would leave the page on Connecting forever.
     settings.cacheMode = WebSettings.LOAD_NO_CACHE
     val cookies = CookieManager.getInstance()
     cookies.setAcceptCookie(true)
     cookies.setAcceptThirdPartyCookies(webView, true)
     webView.clearCache(true)
+}
+
+private class ChatChromeClient : WebChromeClient() {
+    override fun onConsoleMessage(message: ConsoleMessage?): Boolean {
+        if (message == null) return true
+        val line = redactWeb(
+            "${message.messageLevel().name} ${message.sourceId()}:${message.lineNumber()} ${message.message()}"
+        )
+        Log.i(WEB_LOG, line)
+        return true
+    }
+}
+
+private fun redactWeb(text: String): String {
+    return text.replace(Regex("token=[^&\\s\"]+"), "token=redacted")
 }
 
 private fun loadChatUrl(webView: WebView, pageUrl: String) {
@@ -619,26 +645,40 @@ private fun ChatPane(target: ChatTarget, onBack: () -> Unit, showBack: Boolean) 
                 }
             }
         }
-        AndroidView(
-            modifier = Modifier
+        Box(
+            Modifier
                 .fillMaxWidth()
                 .weight(1f),
-            factory = { context ->
-                WebView(context).apply {
-                    prepareChatWebView(this)
-                    webViewClient = WebViewClient()
-                    webChromeClient = WebChromeClient()
-                    tag = target.url
-                    loadChatUrl(this, target.url)
-                }
-            },
-            update = { web ->
-                if (web.tag != target.url) {
-                    web.tag = target.url
-                    loadChatUrl(web, target.url)
-                }
-            },
-        )
+        ) {
+            AndroidView(
+                modifier = Modifier.fillMaxSize(),
+                factory = { context ->
+                    WebView(context).apply {
+                        prepareChatWebView(this)
+                        webViewClient = WebViewClient()
+                        webChromeClient = ChatChromeClient()
+                        tag = target.url
+                        loadChatUrl(this, target.url)
+                    }
+                },
+                update = { web ->
+                    web.layoutParams = ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                    )
+                    if (web.tag != target.url) {
+                        web.tag = target.url
+                        loadChatUrl(web, target.url)
+                    }
+                },
+                onRelease = { web ->
+                    runCatching {
+                        web.stopLoading()
+                        web.destroy()
+                    }
+                },
+            )
+        }
     }
 }
 

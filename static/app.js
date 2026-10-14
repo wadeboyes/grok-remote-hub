@@ -5568,7 +5568,7 @@
       showEmptyMain(false);
       if (state.selectedId) showSessionPane(state.selectedId);
       if (!messages || !messages.length) {
-        appendMessage({ role: "system", text: "No prior transcript on disk for this session." });
+        appendMessage({ role: "system", text: "No messages yet" });
       } else {
         for (const m of messages) {
           appendMessage(m);
@@ -6961,7 +6961,7 @@
         if (!list.length) {
           appendMessage({
             role: "system",
-            text: "No prior transcript on disk for this session.",
+            text: "No messages yet",
           });
         } else {
           for (let i = 0; i < list.length; i++) appendMessage(list[i]);
@@ -7300,6 +7300,16 @@
   }
 
   function connectWs() {
+    // pageshow and bootstrap both call this. A slow session/load used to
+    // leave the first socket up and open a second one a couple of seconds later.
+    const existing = state.ws;
+    if (
+      existing &&
+      (existing.readyState === WebSocket.CONNECTING ||
+        existing.readyState === WebSocket.OPEN)
+    ) {
+      return;
+    }
     if (state.reconnectTimer) {
       clearTimeout(state.reconnectTimer);
       state.reconnectTimer = null;
@@ -11897,9 +11907,22 @@
     const deepLink = readDeepLink();
     if (deepLink.embedChat) {
       document.documentElement.classList.add("embed-chat");
-      // Native app already picked the session. Do not leave the home copy up
-      // while /api/sessions or history is still loading.
+      // Native app already picked the session. Paint the composer before
+      // history and attach return, and connect once.
       showEmptyMain(false);
+      if (deepLink.openId) {
+        state.selectedId = deepLink.openId;
+        state.selectedMeta = {
+          sessionId: deepLink.openId,
+          title: deepLink.title || "Session",
+          cwd: deepLink.cwd || "",
+        };
+        showSessionPane(deepLink.openId);
+        if (!transcriptRoot().querySelector(".term-line")) {
+          appendMessage({ role: "system", text: "No messages yet" });
+        }
+      }
+      connectWs();
     }
 
     try {
