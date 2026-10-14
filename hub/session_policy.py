@@ -25,13 +25,46 @@ ACP_BLIP_USER_MSG = (
 
 
 def is_keepalive_ping_timeout(exc: BaseException | str | None) -> bool:
-    """True for the websockets 1011 keepalive close (busy agent, slow pong)."""
+    """True for the websockets 1011 keepalive close.
+
+    On the loopback agent socket this usually means the hub asyncio loop was
+    blocked and did not answer the ping. A busy Grok turn is not the usual cause.
+    """
     text = str(exc or "").lower()
     if "keepalive ping timeout" in text:
         return True
     if "1011" in text and "ping timeout" in text:
         return True
     return False
+
+
+def is_connection_closed(exc: BaseException | str | None) -> bool:
+    """True when the ACP socket closed and the hub should reconnect."""
+    if exc is None:
+        return False
+    if isinstance(exc, str):
+        return "connection closed" in exc.lower()
+    # Subclasses (tests name them Closed) still count via the base class.
+    for cls in type(exc).__mro__:
+        if cls.__name__.startswith("ConnectionClosed"):
+            return True
+    text = str(exc).lower()
+    return "connection closed" in text
+
+
+def session_stream_kind(update_kind: str | None) -> bool:
+    """True for a real session/update. Client RPCs reset the idle timer only.
+
+    None (permission, terminal, fs) is traffic, not a session/update. User echo
+    is not agent output either. The no-output watchdog stays armed until a
+    session/update arrives, while last_activity still resets on any traffic.
+    """
+    if update_kind is None:
+        return False
+    kind = str(update_kind).strip().lower()
+    if not kind or kind.startswith("user_") or kind == "available_commands_update":
+        return False
+    return True
 
 # Silence after activity — only for truly dead agents (tools can be quiet minutes).
 # Heavy sessions with slow mid-turn tools use this, not first-byte scaling.
@@ -427,13 +460,16 @@ def should_force_clear_turn(
         return (
             f"max turn duration ({age_since_start:.1f}s >= {max_turn_seconds}s)"
         )
+    # Idle timer: silence since the last ACP frame, not a fixed clock from
+    # prompt start. Any traffic resets age_since_activity. The cap above still
+    # ends a turn that keeps talking forever.
     if (
         no_output_seconds > 0
         and not saw_update
-        and age_since_start >= no_output_seconds
+        and age_since_activity >= no_output_seconds
     ):
         return (
-            f"no ACP session/update for {age_since_start:.1f}s after prompt "
+            f"no ACP session/update for {age_since_activity:.1f}s "
             f"(threshold={no_output_seconds}s)"
         )
     if (

@@ -808,6 +808,34 @@ def test_should_force_clear_healthy_long_agentic() -> None:
     )
 
 
+def test_idle_timer_resets_on_acp_traffic() -> None:
+    """Traffic refreshes the idle clock. A silent prompt still clears at 60s."""
+    assert (
+        should_force_clear_turn(
+            False,
+            age_since_start=90.0,
+            age_since_activity=5.0,
+        )
+        is None
+    )
+    reason = should_force_clear_turn(
+        False,
+        age_since_start=90.0,
+        age_since_activity=NO_OUTPUT_SECONDS,
+    )
+    assert reason is not None
+    assert "no ACP session/update" in reason
+    # A turn that already streamed is not cleared by the short idle timer.
+    assert (
+        should_force_clear_turn(
+            True,
+            age_since_start=200.0,
+            age_since_activity=NO_OUTPUT_SECONDS,
+        )
+        is None
+    )
+
+
 def test_should_force_clear_no_output() -> None:
     reason = should_force_clear_turn(
         False,

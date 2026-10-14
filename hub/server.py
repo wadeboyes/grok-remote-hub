@@ -42,6 +42,7 @@ from hub.turn_recover import (
     REATTACHED_MSG,
     RELOADED_MSG,
     RESTART_FAILED_MSG,
+    RESTARTING_SESSION_MSG,
     UNRESUMABLE_RESTART_MSG,
     clearing_message,
     find_dangling_turn,
@@ -138,17 +139,17 @@ REMOTE_SESSION_SYSTEM_NOTE = (
 )
 REMOTE_SESSION_SAME_NOTE = "Live remote session"
 NO_OUTPUT_USER_MSG = (
-    "Agent produced no output. Same session kept — send again."
+    "Agent produced no output. Same session kept. Send again."
 )
-NO_OUTPUT_RECOVERING_MSG = "Recovering session — retrying…"
+NO_OUTPUT_RECOVERING_MSG = "Recovering session. Retrying."
 NO_OUTPUT_RETRY_FAILED_MSG = (
     "Agent still not responding after automatic retry. Try again in a moment."
 )
 MID_TURN_STALL_USER_MSG = (
-    "Agent stalled mid-turn (no activity). Turn cleared — you can send again."
+    "Agent stalled mid-turn with no activity. Turn cleared. You can send again."
 )
 MAX_TURN_USER_MSG = (
-    "Turn hit max duration and was cleared — you can send again."
+    "Turn hit max duration and was cleared. You can send again."
 )
 
 
@@ -726,6 +727,9 @@ class Hub:
                 "sessionId": session_id,
                 "questions": payload.get("questions") or [],
                 "toolCallId": payload.get("toolCallId"),
+                "kind": payload.get("kind") or "question",
+                "title": payload.get("title") or "",
+                "quiet": bool(payload.get("quiet")),
             }
         )
         if session_id:
@@ -861,6 +865,35 @@ class Hub:
         answers = payload.get("answers") or {}
         if not isinstance(answers, dict):
             answers = {}
+        if self.acp.is_permission_waiter(request_id):
+            option_id = ""
+            raw_perm = answers.get("permission")
+            if isinstance(raw_perm, list) and raw_perm:
+                option_id = str(raw_perm[0] or "")
+            elif isinstance(raw_perm, str):
+                option_id = raw_perm
+            if not option_id:
+                for value in answers.values():
+                    if isinstance(value, list) and value:
+                        option_id = str(value[0] or "")
+                        break
+                    if isinstance(value, str) and value:
+                        option_id = value
+                        break
+            if outcome == "cancelled":
+                ok = self.acp.cancel_permission(request_id)
+            else:
+                ok = self.acp.answer_permission(request_id, option_id)
+            await self.broadcast(
+                {
+                    "type": "user_question_resolved",
+                    "requestId": request_id,
+                    "outcome": "cancelled" if outcome == "cancelled" else "accepted",
+                    "ok": ok,
+                }
+            )
+            await self.broadcast(self.status_payload())
+            return
         if outcome == "cancelled":
             ok = self.acp.cancel_user_question(request_id)
         else:
@@ -1887,14 +1920,26 @@ class Hub:
                     if sid and not self.acp.is_session_active(sid):
                         err = MID_TURN_STALL_USER_MSG
                         low = reason.lower()
+                        recovery = None
                         if "max turn" in low:
                             err = MAX_TURN_USER_MSG
                         elif "no acp session/update" in low:
-                            err = NO_OUTPUT_USER_MSG
-                        try:
-                            await self._broadcast_turn(sid, "idle", err)
-                        except Exception:
-                            log.debug("status resync turn idle broadcast failed", exc_info=True)
+                            if sid in self._wedged_sessions:
+                                # The prompt handler restarts this session.
+                                # Do not also show "send again".
+                                err = ""
+                            else:
+                                err = NO_OUTPUT_USER_MSG
+                        if err:
+                            try:
+                                await self._broadcast_turn(
+                                    sid, "idle", err, recovery=recovery
+                                )
+                            except Exception:
+                                log.debug(
+                                    "status resync turn idle broadcast failed",
+                                    exc_info=True,
+                                )
                 bg_now = self.acp.live_bg_activity_sessions()
                 still_active = (
                     self.acp.turn_running
@@ -2214,20 +2259,25 @@ class Hub:
 
         watch: dict[str, Any] | None = None
         watch_path = log_dir / "watch-hub-state.json"
+
+        def _read_watch() -> dict[str, Any] | None:
+            if not watch_path.is_file():
+                return None
+            raw = watch_path.read_text(encoding="utf-8-sig")
+            parsed = json.loads(raw)
+            if not isinstance(parsed, dict):
+                return None
+            return {
+                k: v
+                for k, v in parsed.items()
+                if not any(
+                    s in str(k).lower()
+                    for s in ("secret", "token", "password", "authorization")
+                )
+            }
+
         try:
-            if watch_path.is_file():
-                raw = watch_path.read_text(encoding="utf-8-sig")
-                parsed = json.loads(raw)
-                if isinstance(parsed, dict):
-                    # Never surface secrets if a future schema adds them.
-                    watch = {
-                        k: v
-                        for k, v in parsed.items()
-                        if not any(
-                            s in str(k).lower()
-                            for s in ("secret", "token", "password", "authorization")
-                        )
-                    }
+            watch = await asyncio.to_thread(_read_watch)
         except Exception:
             log.debug("diagnostics watch state read failed", exc_info=True)
             watch = None
@@ -2602,8 +2652,50 @@ class Hub:
             )
             return False
 
+    async def _cwd_for_session(self, session_id: str, cwd: str = "") -> str:
+        folder = (cwd or "").strip()
+        if folder:
+            return folder
+        try:
+            info = await asyncio.to_thread(
+                find_session, self.config.sessions_root, session_id
+            )
+        except Exception:
+            info = None
+        if info is not None:
+            return str(info.cwd or "").strip()
+        return ""
+
+    async def _confirm_dangling_cancel(
+        self, session_id: str, tool_call_id: str, cwd: str
+    ) -> bool:
+        """session/cancel, then require a tool end. Otherwise session/load.
+
+        Returns True only when grok accepted the cancel and emitted an end.
+        A silent cancel still reloads the session so the one prompt is not
+        sent into an orphaned in-memory turn.
+        """
+        accepted = await self._notify_cancel_bounded(session_id)
+        ended = False
+        if accepted and self.acp.connected:
+            ended = await self.acp.wait_for_tool_end(
+                session_id, tool_call_id or "", timeout=2.5
+            )
+        if ended:
+            return True
+        log.warning(
+            "dangling cancel not confirmed session=%s accepted=%s; session/load",
+            session_id[:12],
+            accepted,
+        )
+        folder = await self._cwd_for_session(session_id, cwd)
+        if folder and not self.acp.is_session_active(session_id):
+            self.acp.forget_warm_session(session_id)
+            await self._try_session_load(session_id, folder)
+        return False
+
     async def _cancel_dangling_before_prompt(
-        self, session_id: str, view_session_id: str
+        self, session_id: str, view_session_id: str, cwd: str = ""
     ) -> bool:
         """If the transcript is unfinished, session/cancel before session/prompt.
 
@@ -2619,12 +2711,16 @@ class Hub:
         if sid in self._dangling_checked:
             if sid not in self._wedged_sessions:
                 return False
-            await self._notify_cancel_bounded(sid)
+            await self._confirm_dangling_cancel(sid, "", cwd)
             return True
 
         self._dangling_checked.add(sid)
         path = self._updates_jsonl_path(sid)
-        dangling = find_dangling_turn(path) if path is not None else None
+        dangling = (
+            await asyncio.to_thread(find_dangling_turn, path)
+            if path is not None
+            else None
+        )
         if dangling is None:
             self._clear_wedged(sid)
             return False
@@ -2638,7 +2734,7 @@ class Hub:
             dangling.reason,
             (dangling.label or "")[:80],
         )
-        await self._notify_cancel_bounded(sid)
+        await self._confirm_dangling_cancel(sid, dangling.tool_call_id, cwd)
         if not already:
             await self._broadcast_turn(
                 sid,
@@ -2648,6 +2744,74 @@ class Hub:
                 quiet_notify=True,
             )
         return True
+
+    async def _recover_wedged_silence(
+        self, session_id: str, view_session_id: str, cwd: str
+    ) -> None:
+        """No session/update after cancel and one prompt. Do not send it again.
+
+        Restart grok agent serve only when no other session is mid-turn, then
+        session/load that same id in the new process.
+        """
+        sid = str(session_id or "").strip()
+        if self.acp.last_force_clear_reason:
+            self._last_broadcast_force_clear = self.acp.last_force_clear_reason
+        if self._other_turns_active(sid):
+            await self._broadcast_turn(
+                sid,
+                "idle",
+                OTHER_SESSIONS_MSG,
+                also_session_id=view_session_id,
+                recovery="restart_session",
+            )
+            return
+        await self._broadcast_turn(
+            sid,
+            "running",
+            RESTARTING_SESSION_MSG,
+            also_session_id=view_session_id,
+            quiet_notify=True,
+        )
+        folder = await self._cwd_for_session(sid, cwd)
+        ok, err = await self._restart_agent_process(
+            reason=f"restart wedged session {sid[:12]}",
+            broadcast_error=(
+                "Restarting this session. Other sessions were not in a turn."
+            ),
+        )
+        if not ok:
+            await self._broadcast_turn(
+                sid,
+                "idle",
+                RESTART_FAILED_MSG,
+                also_session_id=view_session_id,
+                recovery="restart_session",
+            )
+            if err:
+                log.warning("wedged restart failed session=%s: %s", sid[:12], err)
+            return
+        self.acp.forget_warm_session(sid)
+        self._dangling_checked.discard(sid)
+        loaded = await self._try_session_load(sid, folder) if folder else False
+        if loaded:
+            if folder:
+                self._record_hub_session(sid, folder)
+            self._clear_wedged(sid)
+            await self._broadcast_turn(
+                sid,
+                "idle",
+                REATTACHED_MSG,
+                also_session_id=view_session_id,
+                quiet_notify=True,
+            )
+            return
+        await self._broadcast_turn(
+            sid,
+            "idle",
+            LOAD_AFTER_RESTART_MSG,
+            also_session_id=view_session_id,
+            recovery="restart_session",
+        )
 
     async def _restart_wedged_session(self, session_id: str, cwd: str) -> dict[str, Any]:
         """Reload one wedged session. Does not start a new session.
@@ -3094,9 +3258,12 @@ class Hub:
 
     async def handle_history(self, request: web.Request) -> web.Response:
         session_id = request.match_info["id"]
-        session = find_session(self.config.sessions_root, session_id)
+        session = await asyncio.to_thread(
+            find_session, self.config.sessions_root, session_id
+        )
         path = session.path if session else None
-        messages = load_session_history(
+        messages = await asyncio.to_thread(
+            load_session_history,
             self.config.sessions_root,
             session_id,
             session_path=path,
@@ -3712,7 +3879,7 @@ class Hub:
         except Exception:
             pass
         await ws.send_str(json.dumps(self.status_payload()))
-        items = self._scan_sessions()
+        await asyncio.to_thread(self._scan_sessions)
         await ws.send_str(json.dumps({"type": "sessions", "items": self._sessions_items_with_status()}))
         # Push cached agent slash commands so reconnect/new clients get real list
         # without waiting for attach or a later available_commands_update.
@@ -4313,7 +4480,7 @@ class Hub:
             )
 
         retry_thr = max(NO_OUTPUT_RETRY_SECONDS, no_output_seconds_for_session())
-        await self._cancel_dangling_before_prompt(session_id, view_session_id)
+        await self._cancel_dangling_before_prompt(session_id, view_session_id, cwd)
         try:
             await self.acp.session_prompt(
                 session_id,
@@ -4741,7 +4908,7 @@ class Hub:
         # ensure path session/new'd if needed; multi-session agent holds id without load.
         thr = no_output_seconds_for_session()
         # Orphaned tool from a dropped turn: cancel before this prompt, not after.
-        await self._cancel_dangling_before_prompt(session_id, view_session_id)
+        await self._cancel_dangling_before_prompt(session_id, view_session_id, cwd)
         try:
             await self.acp.session_prompt(
                 session_id,
@@ -4785,9 +4952,20 @@ class Hub:
                     session_id, f"prompt exception: {exc}"
                 )
 
-            # Hang with zero output: heal + auto-retry once on same session.
+            # A dangling tool that stayed silent is not retried. Restart the
+            # agent when nobody else is in a turn, then load the same session.
             if (
                 not keepalive_blip
+                and session_id in self._wedged_sessions
+                and self._is_no_output_error(exc)
+            ):
+                await self._recover_wedged_silence(
+                    session_id, view_session_id, cwd
+                )
+            # Hang with zero output: heal + auto-retry once on same session.
+            elif (
+                not keepalive_blip
+                and session_id not in self._wedged_sessions
                 and should_auto_retry_no_output(exc, already_retried=not _auto_retry)
             ):
                 await self._no_output_auto_retry(

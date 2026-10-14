@@ -1240,6 +1240,45 @@
   }
 
   /**
+   * One status banner for this session. Replaces the previous banner.
+   * No toast and no transcript line for the same event.
+   */
+  function setSessionNotice(sessionId, message, options) {
+    const msg = String(message || "").trim();
+    if (!msg) return null;
+    const opts = options || {};
+    const sid = sessionId || state.selectedId || null;
+    const action = opts.action || null;
+    const entry = {
+      at: new Date().toISOString(),
+      message: msg,
+      sessionId: sid,
+      source: opts.source || "turn",
+      level: opts.level || "info",
+      resend: !!opts.resend || action === "restart_session",
+      action: action,
+      _sessionNotice: true,
+    };
+    if (!state.sessionNotices) state.sessionNotices = {};
+    const key = sid || "_";
+    state.sessionNotices[key] = entry;
+    if (!state.errorLog) state.errorLog = [];
+    state.errorLog = state.errorLog.filter(function (item) {
+      return !(
+        item &&
+        item._sessionNotice &&
+        (item.sessionId || null) === sid
+      );
+    });
+    state.errorLog.unshift(entry);
+    if (state.errorLog.length > 40) state.errorLog.length = 40;
+    const visible =
+      !sid || sid === state.selectedId || sid === state.liveTurnSessionId;
+    if (visible) updateErrorStrip(entry);
+    return entry;
+  }
+
+  /**
    * Soft recoverable notice (turn cleared, etc.): toast + info strip (auto-dismiss 12s).
    */
   function reportInfo(message, meta = {}) {
@@ -3831,7 +3870,10 @@
       sessionId || state.selectedId || state.liveTurnSessionId || ""
     ).trim();
     if (!sid) {
-      toast("No session to restart", "danger");
+      setSessionNotice(null, "No session to restart.", {
+        level: "danger",
+        source: "restart",
+      });
       return;
     }
     let cwd = "";
@@ -3841,7 +3883,10 @@
       const lp = loadLastPrompt();
       if (lp && lp.cwd) cwd = String(lp.cwd);
     }
-    toast("Restarting this session.", "");
+    setSessionNotice(sid, "Restarting this session.", {
+      level: "info",
+      source: "restart",
+    });
     if (state.ws && state.ws.readyState === WebSocket.OPEN) {
       sendWs({ type: "restart_session", sessionId: sid, cwd: cwd || "" });
       return;
@@ -3858,15 +3903,14 @@
         } catch (_) {}
         const detail =
           (body && body.message) || "Could not restart this session.";
-        if (res.ok && body && body.ok) {
-          reportInfo(detail, { sessionId: sid, source: "restart" });
-        } else {
-          reportError(detail, { sessionId: sid, source: "restart" });
-        }
+        setSessionNotice(sid, detail, {
+          level: res.ok && body && body.ok ? "info" : "danger",
+          source: "restart",
+        });
       })
       .catch(() => {
-        reportError("Could not restart this session.", {
-          sessionId: sid,
+        setSessionNotice(sid, "Could not restart this session.", {
+          level: "danger",
           source: "restart",
         });
       });
@@ -3879,29 +3923,11 @@
     const stripMsg =
       String(message || "").trim() ||
       "Grok produced no output. The last tool call was still pending when the connection dropped.";
-    const entry = {
-      at: new Date().toISOString(),
-      message: stripMsg,
-      sessionId: sessionId || null,
-      source: "turn",
+    setSessionNotice(sessionId, stripMsg, {
       level: "danger",
-      resend: true,
+      source: "turn",
       action: "restart_session",
-    };
-    if (!state.errorLog) state.errorLog = [];
-    state.errorLog.unshift(entry);
-    if (state.errorLog.length > 40) state.errorLog.length = 40;
-    try {
-      console.error("[hub]", stripMsg, { sessionId: sessionId || null });
-    } catch (_) {}
-    toast(stripMsg, "danger", 30000, {
-      actionLabel: "Restart this session",
-      onAction: () => {
-        restartThisSession(sessionId);
-        dismissErrorStrip();
-      },
     });
-    updateErrorStrip(entry);
   }
 
   /**
@@ -3911,28 +3937,11 @@
     const stripMsg =
       (meta && meta.message) ||
       "Agent produced no output. Prompt may not be on disk. Resend.";
-    const entry = {
-      at: new Date().toISOString(),
-      message: stripMsg,
-      sessionId: (lastPrompt && lastPrompt.sessionId) || null,
-      source: (meta && meta.source) || "turn",
-      level: "danger",
-      resend: true,
-    };
-    if (!state.errorLog) state.errorLog = [];
-    state.errorLog.unshift(entry);
-    if (state.errorLog.length > 40) state.errorLog.length = 40;
-    try {
-      console.error("[hub]", stripMsg, meta || {});
-    } catch (_) {}
-    toast(stripMsg, "danger", 30000, {
-      actionLabel: "Resend",
-      onAction: () => {
-        resendLastPrompt();
-        dismissErrorStrip();
-      },
-    });
-    updateErrorStrip(entry);
+    setSessionNotice(
+      (lastPrompt && lastPrompt.sessionId) || null,
+      stripMsg,
+      { level: "danger", source: "turn", resend: true }
+    );
   }
 
   /**
@@ -3955,7 +3964,7 @@
     try {
       console.error("[hub]", stripMsg, meta || {});
     } catch (_) {}
-    toast("Hub restarted — turn interrupted", "danger", 30000, {
+    toast("Hub restarted. Turn interrupted.", "danger", 30000, {
       actionLabel: "Resend",
       onAction: () => {
         resendLastPrompt();
@@ -7825,25 +7834,10 @@
         }
       } else if (msg.state === "running") {
         setTurnRunning(true, sid);
-        // Soft notice during same-session no-output auto-recovery (not a dead-end error).
+        // One banner. The next notice for this session replaces it.
         const runNotice = friendlyHubError(msg.error);
-        const clearingNotice = /still pending|clearing that/i.test(runNotice || "");
-        if (runNotice && (isAcpBlip(runNotice) || /recovering|retrying/i.test(runNotice) || clearingNotice)) {
-          reportInfo(runNotice, { sessionId: sid, source: "turn" });
-          if (isAcpBlip(runNotice) || clearingNotice) {
-            const noteKey = `${sid || "_"}:${runNotice}`;
-            if (!state._turnClearNotes) state._turnClearNotes = {};
-            if (!state._turnClearNotes[noteKey]) {
-              state._turnClearNotes[noteKey] = true;
-              const appendBlipNote = () =>
-                appendMessage({ role: "system", text: runNotice });
-              if (!sid || sid === state.selectedId) {
-                appendBlipNote();
-              } else {
-                withSessionTarget(sid, appendBlipNote);
-              }
-            }
-          }
+        if (runNotice) {
+          setSessionNotice(sid, runNotice, { level: "info", source: "turn" });
         }
       } else if (msg.state === "idle") {
         const anyLeft = (state.liveTurns || []).length > 0;
@@ -7861,17 +7855,6 @@
             if (!state.liveTurnSessionId && state.liveTurns.length) {
               state.liveTurnSessionId =
                 state.liveTurns[state.liveTurns.length - 1].sessionId;
-            }
-          }
-          if (restartSession) offerSessionRestart(String(msg.error || ""), sid);
-          else if (keepPending) {
-            const lp = loadLastPrompt();
-            if (lp && lp.pending && lp.text && String(lp.text).trim()) {
-              offerNoOutputResend(lp, {
-                reason: "no-output",
-                message: msg.error,
-                source: "turn",
-              });
             }
           }
         } else if (anyLeft) {
@@ -7903,24 +7886,25 @@
         }
         if (msg.error) {
           const shown = friendlyHubError(msg.error);
-          if (recoverable) {
-            // Resend or Restart already toasted; avoid a second toast.
-            if (!keepPending && !restartSession) {
-              reportInfo(shown, { sessionId: sid, source: "turn" });
+          if (restartSession) {
+            offerSessionRestart(shown, sid);
+          } else if (recoverable && keepPending) {
+            const lp = loadLastPrompt();
+            if (lp && lp.pending && lp.text && String(lp.text).trim()) {
+              offerNoOutputResend(lp, {
+                reason: "no-output",
+                message: shown,
+                source: "turn",
+              });
+            } else {
+              setSessionNotice(sid, shown, {
+                level: "danger",
+                source: "turn",
+                resend: true,
+              });
             }
-            // Once: also land the notice in the session transcript.
-            const noteKey = `${sid || "_"}:${shown}`;
-            if (!state._turnClearNotes) state._turnClearNotes = {};
-            if (!state._turnClearNotes[noteKey]) {
-              state._turnClearNotes[noteKey] = true;
-              const appendClearNote = () =>
-                appendMessage({ role: "system", text: shown });
-              if (!sid || sid === state.selectedId) {
-                appendClearNote();
-              } else {
-                withSessionTarget(sid, appendClearNote);
-              }
-            }
+          } else if (recoverable) {
+            setSessionNotice(sid, shown, { level: "info", source: "turn" });
           } else {
             reportError(shown, { sessionId: sid, source: "turn" });
           }
@@ -7986,7 +7970,6 @@
 
   function onUserQuestion(msg) {
     const requestId = String(msg.requestId || "");
-    if (!requestId) return;
     // Resolve sessionId with fallbacks so rail always gets a flag.
     const sessionId =
       (msg.sessionId && String(msg.sessionId)) ||
@@ -8001,6 +7984,13 @@
       }
       markSessionActivity(sessionId, "question");
     }
+    if (!requestId) {
+      const title =
+        String(msg.title || "").trim() || "Grok needs your answer.";
+      setSessionNotice(sessionId, title, { level: "info", source: "turn" });
+      if (msg.kind === "plan" && sessionId) refreshSessionPlan(sessionId);
+      return;
+    }
     state.pendingUserQuestion = {
       requestId,
       sessionId,
@@ -8009,7 +7999,15 @@
     };
     // Always open modal so the question stays answerable. Rail "Needs reply"
     // flag remains the primary multi-session notification.
+    const replayed = !!msg.quiet || msg.kind === "permission" || msg.kind === "plan";
     openAskUserModal();
+    if (replayed) {
+      setSessionNotice(sessionId, "Grok needs your answer.", {
+        level: "info",
+        source: "turn",
+      });
+      return;
+    }
     let toastTitle = "";
     if (sessionId && Array.isArray(state.sessions)) {
       const row = state.sessions.find((s) => s && s.sessionId === sessionId);

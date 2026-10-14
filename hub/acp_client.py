@@ -16,6 +16,8 @@ from hub.acp_ask_user import (
 )
 from hub.acp_fs import read_text_file, write_text_file
 from hub.acp_permissions import pick_permission_option
+from hub.history import normalize_status
+from hub.pending_interaction import describe_pending_interaction, permission_as_question
 from hub.acp_terminal import TerminalManager
 from hub.acp_trace import AcpTrace, session_id_slice
 from hub.config import Config
@@ -34,7 +36,9 @@ from hub.session_policy import (
     notification_is_rich_activity,
     session_notification_kind,
     ACP_BLIP_USER_MSG,
+    is_connection_closed,
     is_keepalive_ping_timeout,
+    session_stream_kind,
     should_force_clear_turn,
     should_skip_session_load,
 )
@@ -52,11 +56,15 @@ from hub.status_view import (
 
 log = logging.getLogger("hub.acp")
 
-# The websockets client default ping (20s / 20s) closes a busy grok agent with
-# "sent 1011 (internal error) keepalive ping timeout". Idle half-open sockets
-# are checked by maybe_probe_liveness, which does not run while a prompt is pending.
+# websockets keepalive: a 1011 ping timeout on this loopback client usually means
+# the hub asyncio loop was blocked (file reads, JSON, summaries, git) and could
+# not answer the ping. It does not mean Grok was busy. Disable library pings.
+# Idle half-open sockets are checked by maybe_probe_liveness, which does not run
+# while a prompt is pending. https://websockets.readthedocs.io/en/stable/topics/keepalive.html
 ACP_WS_PING_INTERVAL = None
 ACP_WS_PING_TIMEOUT = None
+# After session/load, a replayed permission or pending_interaction is for Wade.
+POST_LOAD_INTERACTION_S = 8.0
 
 MessageCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 
@@ -175,6 +183,14 @@ class AcpClient:
         self.blip_hold_session_ids: set[str] = set()
         # Hub broadcasts the plain blip notice. (session_id) -> None or awaitable.
         self.on_keepalive_blip: Callable[[str], Awaitable[None] | None] | None = None
+        # session_id -> monotonic deadline to surface replayed interactions.
+        self._post_load_until: dict[str, float] = {}
+        # Permission RPCs waiting on the phone (not auto-approved).
+        self._permission_waiters: dict[str, asyncio.Future] = {}
+        # Sessions with a permission or question on screen. Idle clear skips them.
+        self._pending_interaction_sessions: set[str] = set()
+        # (session_id, tool_call_id, future) resolved when grok ends that tool.
+        self._tool_end_waiters: list[tuple[str, str, asyncio.Future]] = []
         # Proactive WS ping probe timestamps (monotonic).
         self.last_probe_at: float | None = None
         self.last_probe_ok_at: float | None = None
@@ -431,7 +447,9 @@ class AcpClient:
         return str(session_id or "") in self.active_turns
 
     def sessions_with_pending_questions(self) -> set[str]:
-        return set(self._pending_user_question_sessions.values())
+        pending = set(self._pending_user_question_sessions.values())
+        pending.update(self._pending_interaction_sessions)
+        return pending
 
     def turn_age_seconds(self, session_id: str | None = None) -> float | None:
         sid = session_id or self.turn_session_id
@@ -613,6 +631,10 @@ class AcpClient:
             meta = self.active_turns[sid]
             started = meta.get("started_at")
             newly = apply_turn_activity(meta, now=now, update_kind=update_kind)
+            # Any ACP traffic resets last_activity. Only a session/update
+            # counts as agent output for the no-output watchdog.
+            if session_stream_kind(update_kind):
+                meta["saw_session_update"] = True
             if newly:
                 ttfb = None
                 if started is not None:
@@ -1320,10 +1342,56 @@ class AcpClient:
             log.exception("ACP client request %s failed: %s", method, exc)
             await self._reply_error(msg_id, -32000, f"{type(exc).__name__}: {exc}")
 
+    def mark_post_load(self, session_id: str) -> None:
+        """A just-loaded session may replay an orphaned permission or question."""
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        self._post_load_until[sid] = time.monotonic() + POST_LOAD_INTERACTION_S
+
+    def session_accepts_replayed_interaction(self, session_id: str | None) -> bool:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return False
+        if sid in self._loading_sessions:
+            return True
+        until = self._post_load_until.get(sid)
+        return until is not None and time.monotonic() <= until
+
+    def cancel_permission(self, request_id: str) -> bool:
+        fut = self._permission_waiters.get(str(request_id or ""))
+        if fut is None or fut.done():
+            return False
+        fut.set_result("")
+        return True
+
+    def answer_permission(self, request_id: str, option_id: str) -> bool:
+        """Wade picked an option for a replayed permission. Not auto-approve."""
+        key = str(request_id or "")
+        option = str(option_id or "").strip()
+        fut = self._permission_waiters.get(key)
+        if fut is None or fut.done() or not option:
+            return False
+        fut.set_result(option)
+        return True
+
+    def is_permission_waiter(self, request_id: str) -> bool:
+        fut = self._permission_waiters.get(str(request_id or ""))
+        return fut is not None and not fut.done()
+
     async def _handle_permission(self, msg_id: Any, params: dict[str, Any]) -> None:
         options = params.get("options") or []
         if not isinstance(options, list):
             options = []
+        sid = str(
+            params.get("sessionId") or params.get("session_id") or ""
+        ).strip()
+        # After session/load, grok re-sends the orphaned permission. Show it.
+        # A live turn still uses the existing option picker. --always-approve
+        # on the agent process is unchanged.
+        if sid and self.session_accepts_replayed_interaction(sid):
+            await self._surface_permission(msg_id, params, sid)
+            return
         option_id = pick_permission_option(options)
         tool_call = params.get("toolCall") or params.get("tool_call") or {}
         tool_name = ""
@@ -1344,6 +1412,141 @@ class AcpClient:
             msg_id,
             {"outcome": {"outcome": "selected", "optionId": option_id}},
         )
+
+    async def _surface_permission(
+        self, msg_id: Any, params: dict[str, Any], session_id: str
+    ) -> None:
+        shaped = permission_as_question(params)
+        if shaped is None:
+            log.warning(
+                "replayed permission has no options session=%s", session_id[:12]
+            )
+            await self._reply_error(msg_id, -32602, "permission has no options")
+            return
+        key = str(msg_id)
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._permission_waiters[key] = fut
+        self._pending_interaction_sessions.add(session_id)
+
+        def _drop_pending(_fut: asyncio.Future) -> None:
+            self._pending_interaction_sessions.discard(session_id)
+
+        fut.add_done_callback(_drop_pending)
+        payload = {
+            "requestId": key,
+            "sessionId": session_id,
+            "kind": "permission",
+            "quiet": True,
+            "questions": shaped["questions"],
+            "toolCallId": None,
+        }
+        log.info(
+            "permission surfaced to UI session=%s id=%s", session_id[:12], key
+        )
+        try:
+            if self.on_user_question:
+                cb = self.on_user_question(payload)
+                if asyncio.iscoroutine(cb):
+                    await cb
+            option_id = await asyncio.wait_for(fut, timeout=1800.0)
+        except asyncio.TimeoutError:
+            option_id = ""
+            log.warning("replayed permission timed out id=%s", key)
+        finally:
+            self._permission_waiters.pop(key, None)
+            self._pending_interaction_sessions.discard(session_id)
+        if not option_id:
+            # Do not fall through to auto-approve.
+            await self._reply_error(
+                msg_id, -32800, "permission was not answered"
+            )
+            return
+        await self._reply_result(
+            msg_id,
+            {"outcome": {"outcome": "selected", "optionId": str(option_id)}},
+        )
+
+    async def _surface_pending_interaction(
+        self, session_id: str | None, params: dict[str, Any]
+    ) -> None:
+        described = describe_pending_interaction(params)
+        if described is None:
+            return
+        sid = str(session_id or "").strip()
+        if sid and not self.session_accepts_replayed_interaction(sid):
+            return
+        payload = {
+            "requestId": "",
+            "sessionId": sid or None,
+            "kind": described["kind"],
+            "quiet": True,
+            "title": described["title"],
+            "questions": described["questions"],
+            "options": described["options"],
+        }
+        cb = self.on_user_question
+        if cb is None:
+            return
+        try:
+            result = cb(payload)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:
+            log.debug("pending interaction fanout failed", exc_info=True)
+
+    def _note_tool_end(self, session_id: str | None, update: dict[str, Any]) -> None:
+        if not self._tool_end_waiters or not isinstance(update, dict):
+            return
+        kind = str(update.get("sessionUpdate") or update.get("session_update") or "")
+        sid = str(session_id or "")
+        tool_id = str(update.get("toolCallId") or update.get("tool_call_id") or "")
+        status = None
+        if "status" in update:
+            status = normalize_status(update.get("status"))
+        elif "state" in update:
+            status = normalize_status(update.get("state"))
+        turn_done = kind in ("turn_completed", "task_completed", "prompt_complete")
+        tool_done = kind in ("tool_call", "tool_call_update") and status in (
+            "completed",
+            "failed",
+            "cancelled",
+        )
+        if not turn_done and not tool_done:
+            return
+        still: list[tuple[str, str, asyncio.Future]] = []
+        for wait_sid, wait_tool, fut in self._tool_end_waiters:
+            if fut.done():
+                continue
+            if wait_sid and sid and wait_sid != sid:
+                still.append((wait_sid, wait_tool, fut))
+                continue
+            if wait_tool and tool_id and wait_tool != tool_id and not turn_done:
+                still.append((wait_sid, wait_tool, fut))
+                continue
+            fut.set_result(True)
+        self._tool_end_waiters = still
+
+    async def wait_for_tool_end(
+        self,
+        session_id: str,
+        tool_call_id: str = "",
+        timeout: float = 2.5,
+    ) -> bool:
+        """True when grok emits a tool end or a turn end for this session."""
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        entry = (str(session_id or ""), str(tool_call_id or ""), fut)
+        self._tool_end_waiters.append(entry)
+        try:
+            await asyncio.wait_for(fut, timeout=max(0.2, float(timeout)))
+            return True
+        except asyncio.TimeoutError:
+            return False
+        finally:
+            self._tool_end_waiters = [
+                item for item in self._tool_end_waiters if item[2] is not fut
+            ]
 
     def answer_user_question(self, request_id: str, result: dict[str, Any]) -> bool:
         """Resolve a pending ask_user_question with an ACP result dict."""
@@ -1487,11 +1690,15 @@ class AcpClient:
                 # Always stamp bg activity so orphan subagent_progress after
                 # force-clear still paints Working / sessionFlags (not idle).
                 self.note_bg_activity(sid_str, kind=kind_n or None)
+            if (kind_n or "") == "pending_interaction" and isinstance(params, dict):
+                await self._surface_pending_interaction(sid_str, params)
             return
 
         if method not in ("session/update", "_x.ai/session/update"):
             return
         update = update_pre if update_pre else (params.get("update") or {})
+        if isinstance(update, dict):
+            self._note_tool_end(sid_str, update)
         kind = update.get("sessionUpdate") or ""
         # available_commands still applied during load (helper allows this kind).
         if kind == "available_commands_update":
@@ -1652,8 +1859,12 @@ class AcpClient:
         return sid
 
     def note_socket_error(self, exc: BaseException) -> None:
-        """Remember a keepalive ping timeout so a live prompt is not zombie-cleared."""
-        if not is_keepalive_ping_timeout(exc):
+        """Remember a close so a live prompt is reattached, not zombie-cleared.
+
+        A 1011 ping timeout and a ConnectionClosed both reconnect. The ping
+        timeout is usually the hub loop failing to pong, not Grok being busy.
+        """
+        if not (is_keepalive_ping_timeout(exc) or is_connection_closed(exc)):
             return
         self._disconnect_keepalive = True
         if self.active_turns:
@@ -1733,6 +1944,7 @@ class AcpClient:
         if should_skip_session_load(self._warm_sessions, sid):
             log.info("session/load skip already warm sid=%s", sid[:8])
             self.loaded_session_id = sid
+            self.mark_post_load(sid)
             return {"skipped": True, "sessionId": sid}
         # Concurrent attach/ensure: join in-flight load for same sid (one RPC).
         inflight = self._load_inflight.get(sid)
@@ -1762,6 +1974,7 @@ class AcpClient:
                 )
                 self.loaded_session_id = session_id
                 self._warm_sessions.add(sid)
+                self.mark_post_load(sid)
             finally:
                 # Quiet-period release: agent may flush historical frames for many
                 # seconds after the RPC result. Keep sid in _loading_sessions; each
@@ -1922,8 +2135,15 @@ class AcpClient:
                 age_activity = (
                     (now - float(activity_at)) if activity_at is not None else age_start
                 )
+                if session_id in self._pending_interaction_sessions:
+                    # Wade is answering a replayed permission or question.
+                    continue
+                # Idle timer: age_since_activity resets on any ACP traffic.
+                # saw_session_update stays false until a real session/update,
+                # so a silent prompt still clears at about 60s. A turn that
+                # already streamed uses the longer stall, then the cap.
                 reason = should_force_clear_turn(
-                    bool(meta.get("saw_update")),
+                    bool(meta.get("saw_session_update")),
                     age_start,
                     age_activity,
                     no_output_seconds=no_output_seconds,

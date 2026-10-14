@@ -443,6 +443,10 @@ def test_server_cancels_before_prompt_and_keeps_token_auth() -> None:
     cancel_at = execute.find("_cancel_dangling_before_prompt")
     prompt_at = execute.find("session_prompt")
     assert cancel_at >= 0 and prompt_at >= 0 and cancel_at < prompt_at
+    recover_at = execute.find("_recover_wedged_silence")
+    retry_at = execute.find("_no_output_auto_retry")
+    assert recover_at >= 0 and retry_at >= 0 and recover_at < retry_at
+    assert "session_id in self._wedged_sessions" in execute
 
     retry = server[server.find("async def _no_output_auto_retry") :]
     retry = retry[: retry.find("\n    async def ")]
@@ -458,9 +462,15 @@ def test_server_cancels_before_prompt_and_keeps_token_auth() -> None:
 
     dangling = server[server.find("async def _cancel_dangling_before_prompt") :]
     dangling = dangling[: dangling.find("\n    async def ")]
-    assert "_notify_cancel_bounded" in dangling
+    assert "_confirm_dangling_cancel" in dangling
     assert "find_dangling_turn" in dangling
+    assert "asyncio.to_thread" in dangling
     assert "is_session_active" in dangling
+
+    confirm = server[server.find("async def _confirm_dangling_cancel") :]
+    confirm = confirm[: confirm.find("\n    async def ")]
+    assert "_notify_cancel_bounded" in confirm
+    assert "wait_for_tool_end" in confirm
 
     notify = server[server.find("async def _notify_cancel_bounded") :]
     notify = notify[: notify.find("\n    async def ")]
@@ -489,12 +499,15 @@ def test_server_cancels_before_prompt_and_keeps_token_auth() -> None:
 
     js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
     html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
-    assert "20261014f" in html
+    assert "20261014g" in html
     assert 'msg.recovery === "restart_session"' in js
     assert "Restart this session" in js
+    assert "function setSessionNotice" in js
     offer = js[js.find("function offerSessionRestart") :]
     offer = offer[: offer.find("\n  function ")]
-    assert "Restart this session" in offer
+    assert "setSessionNotice" in offer
+    assert 'action: "restart_session"' in offer
+    assert "toast(" not in offer
     assert "send again" not in offer.lower()
     assert "\u2014" not in offer and "\u2013" not in offer
     restart_fn = js[js.find("function restartThisSession") :]
@@ -502,3 +515,61 @@ def test_server_cancels_before_prompt_and_keeps_token_auth() -> None:
     assert 'type: "restart_session"' in restart_fn
     assert "/restart-turn" in restart_fn
     assert "resendLastPrompt" not in restart_fn
+    assert "toast(" not in restart_fn
+
+
+def test_silent_prompt_after_dangling_cancel_restarts_without_retry() -> None:
+    """Load with a pending tool, cancel, silent prompt: restart, no second prompt."""
+
+    async def run(tmp: Path) -> None:
+        folder = _session_tree(tmp)
+        _write(folder / "updates.jsonl", [_execute("Run Command")])
+        hub = _hub(tmp)
+        hub.acp.connected = False
+        hub.acp.notify_agent_cancel = AsyncMock(return_value=True)
+        hub.acp.wait_for_tool_end = AsyncMock(return_value=False)
+        hub.acp.session_prompt = AsyncMock(
+            side_effect=TimeoutError(
+                "Turn force-cleared: no ACP session/update for 60.0s "
+                "after prompt (threshold=60.0s)"
+            )
+        )
+        hub.acp.session_new = AsyncMock(side_effect=AssertionError("session/new"))
+        hub._ensure_hub_agent_session = AsyncMock(
+            return_value=(SID, False, "hub_session", "reuse")
+        )
+        hub._try_session_load = AsyncMock(return_value=True)
+        hub._restart_agent_process = AsyncMock(return_value=(True, None))
+        hub._no_output_auto_retry = AsyncMock(
+            side_effect=AssertionError("must not retry the same prompt")
+        )
+        hub._broadcast_turn = AsyncMock()
+        hub._record_hub_session = MagicMock()
+        hub.broadcast = AsyncMock()
+        await hub._execute_prompt(SID, "Continue", str(tmp / "work"))
+        hub.acp.session_prompt.assert_awaited_once()
+        hub._no_output_auto_retry.assert_not_awaited()
+        hub.acp.session_new.assert_not_awaited()
+        hub._restart_agent_process.assert_awaited()
+        hub._try_session_load.assert_awaited()
+        texts = [
+            str(call.args[2]) if len(call.args) > 2 else ""
+            for call in hub._broadcast_turn.await_args_list
+        ]
+        joined = "\n".join(texts)
+        assert "send again" not in joined.lower()
+        assert "\u2014" not in joined and "\u2013" not in joined
+        assert any("Restarting this session" in text for text in texts)
+        assert any(text == REATTACHED_MSG for text in texts)
+        restart_calls = [
+            call
+            for call in hub._broadcast_turn.await_args_list
+            if len(call.args) > 2 and call.args[2] == REATTACHED_MSG
+        ]
+        assert restart_calls
+        assert restart_calls[-1].kwargs.get("recovery") in (None, "")
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as raw:
+        asyncio.run(run(Path(raw)))

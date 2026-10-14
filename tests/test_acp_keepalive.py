@@ -79,6 +79,21 @@ def test_keepalive_ping_timeout_detector_and_copy() -> None:
     assert "\u2013" not in ACP_BLIP_USER_MSG
 
 
+def test_connection_closed_preserves_a_live_turn() -> None:
+    from websockets.exceptions import ConnectionClosed
+
+    class Closed(ConnectionClosed):
+        def __init__(self) -> None:
+            super().__init__(None, None)
+
+    client = _client()
+    client.active_turns["sid-1"] = {"started_at": 0.0}
+    client.note_socket_error(Closed())
+    assert client.should_preserve_turn_on_disconnect() is True
+    assert "sid-1" in client.blip_hold_session_ids
+    assert "sid-1" in client.active_turns
+
+
 def test_library_ping_disabled_probe_covers_idle() -> None:
     assert ACP_WS_PING_INTERVAL is None
     assert ACP_WS_PING_TIMEOUT is None
@@ -240,7 +255,7 @@ def test_ui_and_hub_use_plain_blip_sentence() -> None:
     assert "1011 \\(internal error\\)" in js or "1011 \\\\(internal error\\\\)" in js
     assert "isAcpBlip" in js
     assert "friendlyHubError" in js
-    assert "20261014f" in html
+    assert "20261014g" in html
     assert "ACP_BLIP_USER_MSG" in server
     assert "blip_hold_session_ids" in server
     on_conn = server[server.find("async def _on_acp_connection") :]

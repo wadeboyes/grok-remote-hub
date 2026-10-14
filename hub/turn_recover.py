@@ -54,6 +54,8 @@ LOAD_AFTER_RESTART_MSG = (
     "The Grok process was restarted, but this session did not load."
 )
 RESTART_BUTTON_LABEL = "Restart this session"
+RESTARTING_SESSION_MSG = "Grok produced no output. Restarting this session."
+NEEDS_ANSWER_MSG = "Grok needs your answer before it can continue."
 
 
 @dataclass(frozen=True)
